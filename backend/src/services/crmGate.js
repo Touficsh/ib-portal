@@ -52,6 +52,7 @@ export class CrmBudgetExceededError extends Error {
 // Bucket names are stable identifiers used in settings.crm_budgets.
 // Matching is done by substring/prefix; the first matching rule wins.
 const ENDPOINT_BUCKETS = [
+  { bucket: 'agent-hierarchy',   match: (p) => p.startsWith('/api/agent-hierarchy') },
   { bucket: 'trading-accounts',  match: (p) => p.includes('/trading-accounts') },
   { bucket: 'commission-levels', match: (p) => p.startsWith('/api/agent-commission-levels') },
   { bucket: 'contacts-list',     match: (p) => /^\/api\/contacts(\?|$)/.test(p) },
@@ -67,9 +68,10 @@ const ENDPOINT_BUCKETS = [
 // branch import + a day of scheduled autoSync without letting runaway code
 // drown the CRM. Tune via settings.crm_budgets (merged with these).
 const DEFAULT_BUDGETS = {
+  'agent-hierarchy':   500,   // 1 call returns full subtree; ~10 imported branches × 48 polls/day
   'trading-accounts':  3000,  // covers Tier 3 hourly (24 × 200) + some headroom
   'commission-levels': 2000,  // one per agent for level sync; generous since incremental
-  'contacts-list':     500,   // paginated list calls
+  'contacts-list':     500,   // legacy paginated list calls (largely retired in favor of agent-hierarchy)
   'contacts-detail':   1000,  // per-contact enrichment
   'products':          50,
   'branches':          50,

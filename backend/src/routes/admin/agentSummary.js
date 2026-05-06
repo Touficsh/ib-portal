@@ -25,6 +25,7 @@ import { syncForAgent as syncSnapshotsForAgent } from '../../services/mt5Snapsho
 import { runCommissionSync, recomputeForAgent } from '../../services/commissionEngine.js';
 import { cacheMw, invalidateCache } from '../../services/responseCache.js';
 import { audit } from '../../services/auditLog.js';
+import { createJob, updateJob, completeJob, failJob } from '../../services/jobTracker.js';
 
 const router = Router();
 router.use(authenticate, requirePermission('portal.admin'));
@@ -225,11 +226,14 @@ router.get('/:userId/mt5-freshness', cacheMw({ ttl: 30 }), async (req, res, next
 //     floor, the floor wins silently. Useful for backfilling a specific
 //     agent when they say "I should have data from March 1".
 router.post('/:userId/sync-mt5', async (req, res, next) => {
+  const jobId = req.headers['x-job-id'] || createJob({ type: 'admin.agent.sync_mt5', label: 'Refreshing MT5 snapshots' });
+  if (req.headers['x-job-id']) updateJob(jobId, { type: 'admin.agent.sync_mt5', label: 'Refreshing MT5 snapshots' });
   try {
     const userId = req.params.userId;
     const maxAgeMinutes = Math.max(0, Number(req.query.maxAge) || 15);
     const onlyMissing = String(req.query.onlyMissing || '').toLowerCase() === 'true';
     const fromDate = req.query.fromDate ? String(req.query.fromDate).trim() : null;
+    updateJob(jobId, { currentStepLabel: onlyMissing ? 'Fetching never-synced logins from MT5 bridge…' : 'Refreshing stale logins from MT5 bridge…' });
 
     // Validate fromDate early so a typo'd value doesn't go to the bridge.
     if (fromDate) {
@@ -284,8 +288,12 @@ router.post('/:userId/sync-mt5', async (req, res, next) => {
       },
     });
 
-    res.json(summary);
-  } catch (err) { next(err); }
+    completeJob(jobId, { synced: summary.logins_synced, failed: summary.logins_failed, engine: engineTriggered });
+    res.json({ ...summary, jobId });
+  } catch (err) {
+    failJob(jobId, err.message);
+    next(err);
+  }
 });
 
 // POST /api/admin/agent-summary/:userId/recompute-commissions

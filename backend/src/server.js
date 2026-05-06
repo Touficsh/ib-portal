@@ -3,7 +3,7 @@ import { fileURLToPath } from 'url';
 import { dirname, resolve } from 'path';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-dotenv.config({ path: resolve(__dirname, '../../.env'), override: true });
+dotenv.config({ path: resolve(__dirname, '../.env'), override: true });
 import express from 'express';
 import cors from 'cors';
 import pinoHttp from 'pino-http';
@@ -103,6 +103,44 @@ async function start() {
 
       logger.info({ userId: id, email }, '[Sync] agent-imported upserted');
       res.json({ ok: true });
+
+      // Fire-and-forget post-webhook sync — only runs when data is actually
+      // stale. Both checks are pure DB reads (zero CRM calls) before deciding
+      // whether to hit CRM, so repeated webhook events are nearly free.
+      const { rows: [importedUser] } = await pool.query(
+        `SELECT u.id, u.parent_agent_id, c.referred_by_agent_id,
+                MAX(cl.synced_at) AS last_comm_sync
+         FROM users u
+         LEFT JOIN clients c ON c.id = u.linked_client_id
+         LEFT JOIN crm_commission_levels cl ON cl.agent_user_id = u.id
+         WHERE u.id = $1 AND u.is_agent = true
+         GROUP BY u.id, u.parent_agent_id, c.referred_by_agent_id`,
+        [id]
+      );
+      if (importedUser) {
+        (async () => {
+          // Commission sync: skip if synced within the last 24 h (same window
+          // as the admin "smart sync"). Prevents repeated CRM calls on retried
+          // or duplicate webhook deliveries.
+          const syncedRecently = importedUser.last_comm_sync &&
+            (Date.now() - new Date(importedUser.last_comm_sync).getTime()) < 24 * 60 * 60 * 1000;
+          if (!syncedRecently) {
+            try {
+              const { syncOneAgentCommissionLevels } = await import('./services/commissionLevelSync.js');
+              await syncOneAgentCommissionLevels(importedUser.id);
+            } catch (e) { logger.warn({ err: e.message }, '[Sync] post-webhook commission sync failed'); }
+          }
+
+          // Parent backfill: skip if parent link is already set in both tables.
+          const parentAlreadySet = importedUser.parent_agent_id && importedUser.referred_by_agent_id;
+          if (!parentAlreadySet) {
+            try {
+              const { backfillAgentParents } = await import('./services/agentParentBackfill.js');
+              await backfillAgentParents({ agentIds: [importedUser.id] });
+            } catch (e) { logger.warn({ err: e.message }, '[Sync] post-webhook parent backfill failed'); }
+          }
+        })();
+      }
     } catch (err) {
       logger.error({ err: err.message }, '[Sync] agent-imported failed');
       res.status(500).json({ error: 'Internal server error' });
@@ -135,6 +173,67 @@ async function start() {
   const { default: adminAgentSummaryRoutes } = await import('./routes/admin/agentSummary.js');
   app.use('/api/admin/agent-summary', adminAgentSummaryRoutes);
 
+  const { default: adminSettingsRoutes } = await import('./routes/admin/settings.js');
+  app.use('/api/admin/settings', adminSettingsRoutes);
+
+  const { default: adminProductsRoutes } = await import('./routes/admin/products.js');
+  app.use('/api/admin/products', adminProductsRoutes);
+  app.use('/api/products', adminProductsRoutes);
+
+  const { default: adminClientsRoutes } = await import('./routes/admin/clients.js');
+  app.use('/api/admin/clients', adminClientsRoutes);
+
+  const { default: adminJobsRoutes } = await import('./routes/admin/jobs.js');
+  app.use('/api/admin/jobs', adminJobsRoutes);
+
+  const { default: agentsRoutes } = await import('./routes/agents.js');
+  app.use('/api/agents', agentsRoutes);
+
+  const { default: usersRoutes } = await import('./routes/users.js');
+  app.use('/api/users', usersRoutes);
+
+  const { default: commissionsRoutes } = await import('./routes/commissions.js');
+  app.use('/api/commissions', commissionsRoutes);
+
+  const { default: branchesRoutes } = await import('./routes/branches.js');
+  app.use('/api/branches', branchesRoutes);
+
+  const { default: adminDocsRoutes } = await import('./routes/admin/docs.js');
+  app.use('/api/admin/docs', adminDocsRoutes);
+
+  const { default: syncRoutes } = await import('./routes/sync.js');
+  app.use('/api/sync', syncRoutes);
+
+  // ── MT5 real-time deal webhook ─────────────────────────────────────
+  // The bridge POSTs every new deal here within ~1 second of execution
+  // (via DealSubscribe → DealSink.OnDealAdd → fire-and-forget HTTP POST).
+  // Auth is by shared secret in X-MT5-Webhook-Secret header (matches
+  // bridge's MT5_WEBHOOK_SECRET env). Mounted BEFORE the auth-protected
+  // routes so it doesn't require a Bearer token.
+  const { default: mt5WebhookRoutes } = await import('./routes/mt5Webhook.js');
+  app.use('/api/mt5/webhook', mt5WebhookRoutes);
+
+  // ── Internal endpoint for the MT5 bridge ───────────────────────────
+  // Localhost-only, no auth — the bridge polls this on startup / reconnect
+  // to fetch its MT5 manager credentials from the portal's `settings` table.
+  // This replaces the old live-crm-sales endpoint of the same path so the
+  // bridge keeps working with `CRM_BACKEND_URL=http://localhost:3001`.
+  app.get('/api/settings/mt5/internal', async (req, res) => {
+    try {
+      const ip = req.ip || req.connection?.remoteAddress || '';
+      const isLocal = ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
+      if (!isLocal) return res.status(403).json({ error: 'Forbidden' });
+      const { rows } = await pool.query(
+        `SELECT key, value FROM settings WHERE key LIKE 'mt5\\_%' ESCAPE '\\'`
+      );
+      const mt5 = {};
+      for (const row of rows) mt5[row.key.replace('mt5_', '')] = row.value;
+      res.json(mt5);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // Health check
   app.get('/api/health', (req, res) => res.json({ status: 'ok', service: 'ib-portal' }));
 
@@ -163,7 +262,11 @@ async function start() {
 
     // Start Commission Engine scheduler if enabled.
     if (process.env.ENABLE_COMMISSION_ENGINE === 'true') {
-      import('./services/commissionEngine.js').then(({ startCommissionScheduler }) => {
+      import('./services/commissionEngine.js').then(async ({ startCommissionScheduler, cleanupOrphanedCycles }) => {
+        // Reclaim any cycles left "running" by a previous process death.
+        // Their in-memory locks died with that process; the DB rows stayed
+        // status='running' indefinitely and clutter the admin dashboard.
+        await cleanupOrphanedCycles().catch(() => {});
         startCommissionScheduler();
       }).catch(err => console.error('[Commissions] Failed to initialize:', err.message));
     }
@@ -174,6 +277,40 @@ async function start() {
         startMt5SyncScheduler();
       }).catch(err => console.error('[MT5Sweep] Failed to initialize:', err.message));
     }
+
+    // Start CRM contact poll scheduler — picks up new clients added to xdev
+    // since the last tick. Opt-in via ENABLE_CONTACT_POLL=true (env). Reads
+    // first 1-3 pages of /api/contacts (newest-first), stops at checkpoint,
+    // imports any whose connectedAgent matches an imported agent.
+    import('./services/contactPollScheduler.js').then(({ startContactPollScheduler }) => {
+      startContactPollScheduler();
+    }).catch(err => console.error('[ContactPoll] Failed to initialize:', err.message));
+
+    // Start branch hierarchy refresh scheduler — every 30 min, walks each
+    // imported branch via /api/agent-hierarchy. Catches new sub-agents,
+    // new clients, new leads, and new MT5 logins in one call per branch.
+    // Replaces the old contact-list page-1 trick with a more comprehensive
+    // refresh. Opt-in via ENABLE_BRANCH_HIERARCHY_POLL (default: true).
+    import('./services/branchHierarchyScheduler.js').then(({ startBranchHierarchyScheduler }) => {
+      startBranchHierarchyScheduler();
+    }).catch(err => console.error('[BranchHierPoll] Failed to initialize:', err.message));
+
+    // Start MT5 hot-login fast sweep — every 5 min, only logins active in
+    // last 24h. Catches deals on currently-trading accounts within minutes.
+    // Bridge-only — no CRM/Supabase load. Runs alongside the regular sweep.
+    if (process.env.ENABLE_COMMISSION_ENGINE === 'true') {
+      import('./services/mt5HotLoginSweep.js').then(({ startMt5HotLoginSweep }) => {
+        startMt5HotLoginSweep();
+      }).catch(err => console.error('[MT5HotSweep] Failed to initialize:', err.message));
+    }
+
+    // Start daily CRM agent refresh — once per day at configurable UTC hour
+    // (default 4 AM). Pulls /api/agents/query so new agents/branches added
+    // to xdev appear in the Import Agents picker without admin clicks.
+    import('./services/dailyAgentRefresh.js').then(({ startDailyAgentRefresh }) => {
+      startDailyAgentRefresh();
+    }).catch(err => console.error('[DailyAgentRefresh] Failed to initialize:', err.message));
+
   });
 }
 

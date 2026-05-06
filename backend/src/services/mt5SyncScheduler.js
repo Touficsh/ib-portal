@@ -63,10 +63,25 @@ export async function runMt5Sweep({ activeDays = DEFAULT_ACTIVE_DAYS } = {}) {
   };
 
   try {
-    // Find active logins: traded recently OR never contacted
-    // Only logins that already have a trading_accounts_meta row with a valid
-    // product mapping — without product_source_id the commission engine can't
-    // assign deals to a product anyway.
+    // Find logins to sweep this cycle. Three branches, OR'd together so the
+    // sweep catches every legitimate state:
+    //   1. Never contacted — first-time sync (mt5_synced_at IS NULL)
+    //   2. Synced more than `STALE_THRESHOLD_MIN` ago — refresh, regardless of
+    //      whether they've traded recently. This is the critical fix for
+    //      "previously-dormant login suddenly trades": before, those were
+    //      filtered out forever because their cache was empty AND they had
+    //      mt5_synced_at set. Now they get re-checked every cycle.
+    //   3. Had deal activity in the active window — kept as a safety net
+    //      (matches the previous behavior).
+    //
+    // The threshold is set just under the sweep interval so each login is
+    // re-fetched at most once per cycle. With interval=60min, threshold=50min:
+    // a login synced 51 min ago is eligible; 49 min ago is skipped.
+    //
+    // The bridge call is essentially free (local, no CRM cost). With ~1,300
+    // total non-demo logins, a full cycle takes ~80s at concurrency=8.
+    const STALE_THRESHOLD_MIN = Math.max(5, Math.floor((Number(process.env.MT5_SWEEP_INTERVAL_MIN) || 60) * 0.85));
+
     const { rows: logins } = await pool.query(
       `SELECT DISTINCT tam.login
        FROM trading_accounts_meta tam
@@ -76,7 +91,10 @@ export async function runMt5Sweep({ activeDays = DEFAULT_ACTIVE_DAYS } = {}) {
            -- Never contacted (first-time sync)
            tam.mt5_synced_at IS NULL
            OR
-           -- Had deal activity in the active window
+           -- Stale — last fetched more than STALE_THRESHOLD_MIN ago
+           tam.mt5_synced_at < NOW() - ($2 || ' minutes')::interval
+           OR
+           -- Had deal activity in the active window (legacy safety net)
            EXISTS (
              SELECT 1 FROM mt5_deal_cache d
              WHERE d.login = tam.login
@@ -84,7 +102,7 @@ export async function runMt5Sweep({ activeDays = DEFAULT_ACTIVE_DAYS } = {}) {
                AND d.deal_time > NOW() - ($1 || ' days')::interval
            )
          )`,
-      [String(activeDays)]
+      [String(activeDays), String(STALE_THRESHOLD_MIN)]
     );
 
     summary.logins_scanned = logins.length;
@@ -167,6 +185,19 @@ export async function runMt5Sweep({ activeDays = DEFAULT_ACTIVE_DAYS } = {}) {
  * First run is delayed by `delayMin` to let the server warm up and avoid
  * hammering the bridge immediately on every restart.
  */
+// Scheduler-state for the admin UI's "next run in X min" display.
+let _sweepIntervalMs = null;
+let _sweepNextRunAt  = null;
+let _sweepLastRunAt  = null;
+
+export function getMt5SweepStatus() {
+  return {
+    intervalMs: _sweepIntervalMs,
+    nextRunAt:  _sweepNextRunAt,
+    lastRunAt:  _sweepLastRunAt,
+  };
+}
+
 export function startMt5SyncScheduler({
   intervalMin = DEFAULT_INTERVAL_MIN,
   activeDays  = DEFAULT_ACTIVE_DAYS,
@@ -186,22 +217,25 @@ export function startMt5SyncScheduler({
   const intervalMs = effectiveInterval * 60 * 1000;
   const delayMs    = effectiveDelay    * 60 * 1000;
 
+  _sweepIntervalMs = intervalMs;
+  _sweepNextRunAt  = new Date(Date.now() + delayMs).toISOString();
+
   console.log(
     `[MT5Sweep] Scheduler starting — interval=${effectiveInterval}min, ` +
     `activeDays=${effectiveDays}, first run in ${effectiveDelay}min`
   );
 
+  function tick() {
+    _sweepLastRunAt = new Date().toISOString();
+    _sweepNextRunAt = new Date(Date.now() + intervalMs).toISOString();
+    runMt5Sweep({ activeDays: effectiveDays })
+      .catch(err => console.error('[MT5Sweep] run failed:', err.message));
+  }
+
   // Delayed first run so the server has fully initialized
   const firstRun = setTimeout(() => {
-    runMt5Sweep({ activeDays: effectiveDays })
-      .catch(err => console.error('[MT5Sweep] first run failed:', err.message));
-
-    // Then repeat on the regular interval
-    setInterval(() => {
-      runMt5Sweep({ activeDays: effectiveDays })
-        .catch(err => console.error('[MT5Sweep] scheduled run failed:', err.message));
-    }, intervalMs).unref();
-
+    tick();
+    setInterval(tick, intervalMs).unref();
   }, delayMs);
 
   firstRun.unref();

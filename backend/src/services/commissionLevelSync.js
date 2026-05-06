@@ -247,6 +247,43 @@ export async function syncOneAgentCommissionLevels(agentUserId) {
     }
   }
 
+  // ── Push rates → agent_products ─────────────────────────────────────
+  // After writing to crm_commission_levels, backfill agent_products.rate_per_lot
+  // with the highest active commission_per_lot for each (agent, product).
+  // This keeps the cascade validator and commission tree display in sync.
+  // Zero CRM calls — pure DB.
+  if (summary.wallets_seen > 0 && summary.errors === 0) {
+    try {
+      // Raise products.max_rate_per_lot ceiling first so cascade validates
+      await pool.query(`
+        UPDATE products p
+        SET max_rate_per_lot = sub.max_rate, updated_at = NOW()
+        FROM (
+          SELECT product_id, MAX(commission_per_lot) AS max_rate
+          FROM crm_commission_levels
+          WHERE agent_user_id = $1 AND is_active = true AND commission_per_lot > 0
+          GROUP BY product_id
+        ) sub
+        WHERE p.id = sub.product_id AND sub.max_rate > p.max_rate_per_lot
+      `, [agentUserId]);
+
+      // Update agent_products.rate_per_lot where CRM has a non-zero rate
+      await pool.query(`
+        UPDATE agent_products ap
+        SET rate_per_lot = sub.best_rate, updated_at = NOW()
+        FROM (
+          SELECT product_id, MAX(commission_per_lot) AS best_rate
+          FROM crm_commission_levels
+          WHERE agent_user_id = $1 AND is_active = true AND commission_per_lot > 0
+          GROUP BY product_id
+        ) sub
+        WHERE ap.agent_id = $1 AND ap.product_id = sub.product_id
+      `, [agentUserId]);
+    } catch (err) {
+      console.warn('[CommissionLevelSync] agent_products push failed for', agentUserId, '-', err.message);
+    }
+  }
+
   return summary;
 }
 

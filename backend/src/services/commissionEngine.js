@@ -31,36 +31,21 @@
  */
 import pool from '../db/pool.js';
 import { createNotification, isDuplicate } from './notificationService.js';
+import { resolveLoginToProduct } from './mt5LoginResolver.js';
+import { getCommissionTrigger, getMt5VolumeDivisor } from './settingsCache.js';
 
 const MT5_BRIDGE = process.env.MT5_BRIDGE_URL || 'http://localhost:5555';
-const DEFAULT_VOLUME_DIVISOR = 10_000;
 const MAX_TREE_DEPTH = 50;  // safety cap in recursive CTE
 
 /**
- * Fetch a setting from the `settings` table with an in-memory fallback.
- * Returns the string value (or the default) — caller handles parsing.
- */
-async function getSetting(key, defaultValue) {
-  try {
-    const { rows } = await pool.query('SELECT value FROM settings WHERE key = $1', [key]);
-    return rows[0]?.value ?? defaultValue;
-  } catch {
-    return defaultValue;
-  }
-}
-
-/**
- * Read current commission_trigger + volume divisor from settings.
- * Cached per-cycle by `runCommissionSync`; pass through to `processLogin`.
+ * Read current commission_trigger + volume divisor from settings via the
+ * shared settingsCache. Cached per-cycle by `runCommissionSync`; pass
+ * through to `processLogin`.
  */
 async function loadRuntimeConfig() {
-  const trigger = (await getSetting('commission_trigger', 'on_open')).toLowerCase();
-  const divisorRaw = await getSetting('mt5_volume_divisor', String(DEFAULT_VOLUME_DIVISOR));
-  const divisor = Number(divisorRaw) || DEFAULT_VOLUME_DIVISOR;
-  const validTriggers = new Set(['on_open', 'on_close', 'round_turn']);
   return {
-    trigger: validTriggers.has(trigger) ? trigger : 'on_open',
-    volumeDivisor: divisor,
+    trigger:       await getCommissionTrigger(),
+    volumeDivisor: await getMt5VolumeDivisor(),
   };
 }
 
@@ -659,6 +644,81 @@ let isRunning = false;
 let lastRunAt = null;
 let lastRunSummary = null;
 
+/**
+ * Clean up cycles left in 'running' status by a previous process. The in-
+ * memory `isRunning` lock resets to false on each portal startup; any cycle
+ * still 'running' in the DB is by definition orphaned (its lock-holder
+ * process is gone). Same applies to jobs left in 'running' — their worker
+ * died.
+ *
+ * Called at portal startup. Marks all such rows as 'abandoned' with
+ * finished_at = NOW(). Optionally restrict by age via `olderThanMinutes`
+ * (default 0 = clean everything currently 'running').
+ *
+ * Note: this assumes single-portal deployment. If you ever run two portal
+ * processes against the same DB, raise olderThanMinutes above the longest
+ * legitimate cycle duration (~15 min) so you don't kill a peer's cycle.
+ *
+ * Returns the number of rows reclaimed.
+ */
+export async function cleanupOrphanedCycles({ olderThanMinutes = 0 } = {}) {
+  try {
+    // 1. Mark orphaned cycle rows as abandoned. After a portal restart
+    //    any cycle still 'running' belongs to the dead process — its
+    //    in-memory `isRunning` lock and worker pool are gone.
+    const cycles = await pool.query(
+      `UPDATE commission_engine_cycles
+          SET status = 'abandoned',
+              finished_at = NOW()
+        WHERE status = 'running'
+          AND started_at < NOW() - ($1 || ' minutes')::interval`,
+      [String(olderThanMinutes)]
+    );
+
+    // 2. Reset orphaned 'running' job rows. 'running' jobs are atomic claims
+    //    (FOR UPDATE SKIP LOCKED) — a still-running row after restart is a
+    //    worker that died mid-claim.
+    const runningJobs = await pool.query(
+      `UPDATE commission_engine_jobs
+          SET status = 'queued',
+              started_at = NULL,
+              next_retry_at = NULL
+        WHERE status = 'running'`
+    );
+
+    // 3. DELETE queued jobs that belong to a cycle that's done (abandoned/
+    //    failed/succeeded). Each cycle's worker pool only drains its own
+    //    cycle's jobs, so if a cycle ended without finishing all of them,
+    //    those queued jobs are stranded forever — no worker will ever
+    //    pick them up. The next cycle will recreate any work that's still
+    //    needed (it queries trading_accounts_meta from scratch).
+    const strandedJobs = await pool.query(
+      `DELETE FROM commission_engine_jobs
+        WHERE status = 'queued'
+          AND cycle_id IN (
+            SELECT id FROM commission_engine_cycles
+             WHERE status IN ('abandoned', 'failed', 'succeeded', 'partial')
+          )`
+    );
+
+    if (cycles.rowCount > 0 || runningJobs.rowCount > 0 || strandedJobs.rowCount > 0) {
+      console.log(
+        `[Commissions] startup cleanup — ${cycles.rowCount} cycle(s) abandoned, ` +
+        `${runningJobs.rowCount} running job(s) requeued, ` +
+        `${strandedJobs.rowCount} stranded job(s) dropped`
+      );
+    }
+    return {
+      cycles: cycles.rowCount,
+      jobs_requeued: runningJobs.rowCount,
+      jobs_stranded_dropped: strandedJobs.rowCount,
+    };
+  } catch (err) {
+    console.warn('[Commissions] cleanupOrphanedCycles failed:', err.message);
+    return { cycles: 0, jobs_requeued: 0, jobs_stranded_dropped: 0 };
+  }
+}
+
 const JOB_CONCURRENCY   = 8;
 const RETRY_BACKOFF_SEC = [30, 120, 600];  // attempt 1 → 30s, attempt 2 → 2m, attempt 3 → 10m
 const DEFAULT_MAX_ATTEMPTS = 3;
@@ -763,8 +823,57 @@ export async function runCommissionSync({ sinceISO, triggeredBy = 'scheduled', t
   try {
     const config = await loadRuntimeConfig();
 
+    // ── Bridge-driven login → product resolution (2026-05-04+) ──────────
+    // Before enqueueing, resolve any login whose product_source_id is NULL
+    // by asking the MT5 bridge for its group and looking up mt5_groups. This
+    // permanently replaces the old eager `/api/contacts/:id/trading-accounts`
+    // path: every unresolved login that has a deal in cache gets one bridge
+    // call (or hits the negative cache), and on success the resolver writes
+    // product_source_id back to trading_accounts_meta — so subsequent cycles
+    // skip the resolver entirely for that login.
+    //
+    // We only resolve logins that actually have cached deals AND a known
+    // client/agent — otherwise there's no commission to compute and resolving
+    // would just burn bridge calls.
+    let resolverAttempted = 0, resolverResolved = 0, resolverFailed = 0;
+    try {
+      const { rows: unresolved } = await pool.query(
+        `SELECT DISTINCT tam.login
+           FROM trading_accounts_meta tam
+           JOIN clients c ON c.id = tam.client_id
+           JOIN mt5_deal_cache d ON d.login = tam.login
+          WHERE tam.product_source_id IS NULL
+            AND c.agent_id IS NOT NULL
+            AND tam.account_type IS DISTINCT FROM 'demo'
+          LIMIT 500`
+      );
+      resolverAttempted = unresolved.length;
+      // Sequential — bridge gate already throttles concurrency, and resolving
+      // 100s of logins per cycle is fine at ~50ms each.
+      for (const r of unresolved) {
+        try {
+          const resolved = await resolveLoginToProduct(r.login);
+          if (resolved) resolverResolved++;
+          else resolverFailed++;
+        } catch {
+          resolverFailed++;
+        }
+      }
+      if (resolverAttempted > 0) {
+        console.log(`[Commissions] resolver pre-pass: ${resolverResolved}/${resolverAttempted} logins mapped, ${resolverFailed} unmapped/failed`);
+      }
+    } catch (resolverErr) {
+      // Non-fatal — engine still processes the already-mapped logins
+      console.warn('[Commissions] resolver pre-pass failed:', resolverErr.message);
+    }
+    summary.resolverAttempted = resolverAttempted;
+    summary.resolverResolved = resolverResolved;
+    summary.resolverFailed = resolverFailed;
+
     // Enqueue jobs (same eligibility query as before — demo-excluded
     // (client, login, product) triples from trading_accounts_meta).
+    // Logins still NULL after the resolver pre-pass are simply skipped
+    // this cycle (admin maps the group, next cycle picks them up).
     const { rows: pairs } = await pool.query(
       `SELECT c.id AS client_id, c.agent_id,
               tam.login, p.id AS product_id
@@ -1046,30 +1155,51 @@ export async function retryDeadJobs({ cycleId } = {}) {
   return { reset: rows.length, cycleId: target };
 }
 
+// Scheduler-state vars exposed to the admin UI so it can show "next cycle in
+// X min". These are updated synchronously by the scheduler tick — `nextRunAt`
+// is set to NOW + intervalMs at the start of every run, which means the UI's
+// countdown is accurate even if a cycle takes 3+ min to complete.
+let scheduledIntervalMs = null;   // null = scheduler not armed
+let nextScheduledAt    = null;    // ISO timestamp of the NEXT planned cycle
+
 export function getEngineStatus() {
-  return { isRunning, lastRunAt, lastRunSummary };
+  return {
+    isRunning,
+    lastRunAt,
+    lastRunSummary,
+    intervalMs:    scheduledIntervalMs,
+    nextRunAt:     nextScheduledAt,
+  };
 }
 
 let intervalId = null;
 
 /**
  * Start the interval-driven scheduler. `intervalMin` defaults to
- * COMMISSION_SYNC_INTERVAL_MIN env var, else 15 minutes. First run
- * occurs `delayMin` minutes after startup to let the app warm up.
+ * COMMISSION_SYNC_INTERVAL_MIN env var, else 60 minutes (post-2026-05-04
+ * the scheduler is a backstop; per-deal commissions write in real-time via
+ * the webhook receiver). First run occurs `delayMin` minutes after startup
+ * to let the app warm up.
  */
 export function startCommissionScheduler({ intervalMin, delayMin = 3 } = {}) {
   if (intervalId) return;
-  const min = Number(intervalMin ?? process.env.COMMISSION_SYNC_INTERVAL_MIN ?? 15);
+  const min = Number(intervalMin ?? process.env.COMMISSION_SYNC_INTERVAL_MIN ?? 60);
   const intervalMs = Math.max(1, min) * 60 * 1000;
   const delayMs = Math.max(0, delayMin) * 60 * 1000;
 
+  scheduledIntervalMs = intervalMs;
+  nextScheduledAt = new Date(Date.now() + delayMs).toISOString();
+
   console.log(`[Commissions] scheduler armed — interval ${min}min, first run in ${delayMin}min`);
 
+  function tick() {
+    nextScheduledAt = new Date(Date.now() + intervalMs).toISOString();
+    runCommissionSync().catch(err => console.error('[Commissions] interval error:', err.message));
+  }
+
   setTimeout(() => {
-    runCommissionSync().catch(err => console.error('[Commissions] first run error:', err.message));
-    intervalId = setInterval(() => {
-      runCommissionSync().catch(err => console.error('[Commissions] interval error:', err.message));
-    }, intervalMs);
+    tick();   // first run
+    intervalId = setInterval(tick, intervalMs);
   }, delayMs);
 }
 

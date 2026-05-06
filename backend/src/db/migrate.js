@@ -43,8 +43,14 @@ CREATE TABLE IF NOT EXISTS roles (
 );
 
 -- Add role_id FK on users now that roles exists
-ALTER TABLE users ADD CONSTRAINT IF NOT EXISTS users_role_id_fkey
-  FOREIGN KEY (role_id) REFERENCES roles(id);
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'users_role_id_fkey'
+  ) THEN
+    ALTER TABLE users ADD CONSTRAINT users_role_id_fkey
+      FOREIGN KEY (role_id) REFERENCES roles(id);
+  END IF;
+END $$;
 
 -- User-level permission overrides
 CREATE TABLE IF NOT EXISTS user_permission_overrides (
@@ -486,12 +492,89 @@ VALUES
    'all', true, true),
   ('agent', 'IB/Agent — portal access, own referred clients + downline aggregates',
    ARRAY['portal.access','portal.clients.view','portal.commissions.view',
+         'portal.summary.view','portal.commission_tree.view',
          'portal.subagents.view','portal.products.manage'],
    'assigned', true, false),
   ('readonly', 'View-only access',
-   ARRAY['portal.access','portal.clients.view','portal.commissions.view'],
+   ARRAY['portal.access','portal.clients.view','portal.commissions.view',
+         'portal.summary.view','portal.commission_tree.view'],
    'all', true, false)
 ON CONFLICT (name) DO NOTHING;
+
+-- Existing roles created before 2026-05-01 won't have the new portal permission
+-- keys (portal.summary.view, portal.commission_tree.view) because the
+-- INSERT above is ON CONFLICT DO NOTHING. Top them up here so existing
+-- agent / readonly roles include the new keys without admins manually editing.
+UPDATE roles SET permissions = ARRAY(
+  SELECT DISTINCT unnest(permissions || ARRAY['portal.summary.view','portal.commission_tree.view'])
+)
+WHERE name IN ('agent','readonly')
+  AND NOT (
+    permissions @> ARRAY['portal.summary.view']
+    AND permissions @> ARRAY['portal.commission_tree.view']
+  );
+
+-- ============================================================
+-- Hardening migrations (2026-04-30)
+-- ============================================================
+
+-- Engine's rate-source audit columns. The engine writes ccl_pct/ccl_per_lot/
+-- rate_source on every commission row so we can answer "which CRM-level row
+-- produced this amount" without re-deriving. Without these the engine's
+-- INSERT fails silently and every cycle reports succeeded with 0 inserts.
+ALTER TABLE commissions
+  ADD COLUMN IF NOT EXISTS ccl_pct       NUMERIC(8,4),
+  ADD COLUMN IF NOT EXISTS ccl_per_lot   NUMERIC(12,4),
+  ADD COLUMN IF NOT EXISTS rate_source   VARCHAR(20);
+
+
+-- Flip the two CASCADE FKs that would wipe historical financial rows on a
+-- client hard-delete. Now NO ACTION — caller must explicitly reassign or
+-- soft-delete before removing a client. Idempotent: drops by name, re-adds
+-- with the new ON DELETE rule.
+DO $hardening_fks$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'commissions_client_id_fkey') THEN
+    ALTER TABLE commissions DROP CONSTRAINT commissions_client_id_fkey;
+  END IF;
+  ALTER TABLE commissions
+    ADD CONSTRAINT commissions_client_id_fkey
+    FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE NO ACTION;
+
+  IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'commission_engine_jobs_client_id_fkey') THEN
+    ALTER TABLE commission_engine_jobs DROP CONSTRAINT commission_engine_jobs_client_id_fkey;
+  END IF;
+  ALTER TABLE commission_engine_jobs
+    ADD CONSTRAINT commission_engine_jobs_client_id_fkey
+    FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE NO ACTION;
+END $hardening_fks$;
+
+-- Auto-stamp updated_at on every UPDATE so app code can never forget. One
+-- shared trigger function, applied to every table that carries updated_at.
+CREATE OR REPLACE FUNCTION tg_set_updated_at() RETURNS TRIGGER AS $tgu$
+BEGIN
+  NEW.updated_at = NOW();
+  RETURN NEW;
+END;
+$tgu$ LANGUAGE plpgsql;
+
+DO $tg_attach$
+DECLARE
+  t TEXT;
+BEGIN
+  FOR t IN
+    SELECT c.table_name
+    FROM information_schema.columns c
+    JOIN information_schema.tables tt
+      ON tt.table_schema = c.table_schema AND tt.table_name = c.table_name
+    WHERE c.table_schema = 'public'
+      AND c.column_name = 'updated_at'
+      AND tt.table_type = 'BASE TABLE'
+  LOOP
+    EXECUTE format('DROP TRIGGER IF EXISTS set_updated_at ON public.%I;', t);
+    EXECUTE format('CREATE TRIGGER set_updated_at BEFORE UPDATE ON public.%I FOR EACH ROW EXECUTE FUNCTION tg_set_updated_at();', t);
+  END LOOP;
+END $tg_attach$;
 
 -- Refresh planner statistics on hottest tables
 ANALYZE commissions;

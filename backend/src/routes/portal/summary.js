@@ -36,11 +36,14 @@
  */
 import { Router } from 'express';
 import pool from '../../db/pool.js';
-import { portalAuthenticate, requireAgentAccess, requirePortalAdmin } from '../../middleware/portalAuth.js';
+import { portalAuthenticate, requireAgentAccess, requirePortalAdmin, requirePortalPermission } from '../../middleware/portalAuth.js';
 import { syncForAgent as syncSnapshotsForAgent } from '../../services/mt5SnapshotSync.js';
 import { wrap as cacheWrap, invalidate as cacheInvalidate } from '../../services/cache.js';
 
 const router = Router();
+// Auth + portal access first, then per-route permission checks. The summary
+// listing is gated by `portal.summary.view`; admin sub-routes (sync-mt5) keep
+// their existing requirePortalAdmin guard.
 router.use(portalAuthenticate, requireAgentAccess);
 
 // Cache TTL for the summary payload. 30s is short enough that the "freshness"
@@ -54,7 +57,7 @@ const SUMMARY_TTL_MS = 30_000;
 //   to=YYYY-MM-DD      (optional) — upper bound for commission period (forward-compat)
 //   products=id1,id2   (optional) — filter to only these product_source_id values.
 //                                    Empty / absent = no filter (all products).
-router.get('/', async (req, res, next) => {
+router.get('/', requirePortalPermission('portal.summary.view'), async (req, res, next) => {
   try {
     const fromISO = req.query.from ? `${req.query.from} 00:00:00` : null;
     const toISO   = req.query.to   ? `${req.query.to} 23:59:59`   : null;

@@ -32,6 +32,8 @@ export const ALL_PERMISSIONS = [
   { key: 'portal.access', label: 'Access the agent portal', category: 'Portal' },
   { key: 'portal.clients.view', label: 'View own referred clients', category: 'Portal' },
   { key: 'portal.commissions.view', label: 'View commission ledger', category: 'Portal' },
+  { key: 'portal.summary.view', label: 'View hierarchical summary', category: 'Portal' },
+  { key: 'portal.commission_tree.view', label: 'View commission tree (rates)', category: 'Portal' },
   { key: 'portal.subagents.view', label: 'View direct sub-agents', category: 'Portal' },
   { key: 'portal.products.manage', label: 'Assign products to sub-agents', category: 'Portal' },
   { key: 'portal.admin', label: 'Admin-side agent & product management', category: 'Portal' },

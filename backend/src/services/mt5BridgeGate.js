@@ -192,8 +192,37 @@ async function bridgeRequestImpl(path, { method, headers, body, signal, resolveJ
   }
 }
 
+// Cached snapshot of the bridge's /health endpoint. Refreshed lazily —
+// the /status admin endpoint already caches for 5s, so we layer one short-
+// TTL cache here so multiple consumers in the same response don't refetch.
+let bridgeHealthCache = null;
+let bridgeHealthCacheAt = 0;
+const BRIDGE_HEALTH_TTL_MS = 5_000;
+
+async function fetchBridgeHealth() {
+  if (bridgeHealthCache && Date.now() - bridgeHealthCacheAt < BRIDGE_HEALTH_TTL_MS) {
+    return bridgeHealthCache;
+  }
+  try {
+    const r = await fetch(`${BRIDGE_URL}/health`, { signal: AbortSignal.timeout(2000) });
+    if (r.ok) {
+      bridgeHealthCache = await r.json();
+      bridgeHealthCacheAt = Date.now();
+    } else {
+      bridgeHealthCache = null;
+    }
+  } catch {
+    bridgeHealthCache = null;
+  }
+  return bridgeHealthCache;
+}
+
 export async function getMt5GateState() {
   const gate = await getGateSettings();
+  // Pull bridge health alongside gate state so the admin UI can show
+  // "connected for 4h 12m" / "connected since 02:18 UTC" without a separate
+  // HTTP roundtrip. Failure is non-fatal: bridge_health stays null.
+  const bridgeHealth = await fetchBridgeHealth();
   return {
     paused: gate.paused,
     ratePerSecond: gate.ratePerSecond,
@@ -203,6 +232,10 @@ export async function getMt5GateState() {
     queuedForConcurrency: concurrencyWaitQueue.length,
     balanceCacheSize: balanceCache.size,
     inFlightDedupActive: inFlightRequests.size,
+    // Bridge connection state — null when bridge is unreachable.
+    mt5_connected:    bridgeHealth?.mt5Connected ?? null,
+    connected_since:  bridgeHealth?.connectedSince ?? null,
+    bridge_init_error: bridgeHealth?.initError ?? null,
   };
 }
 

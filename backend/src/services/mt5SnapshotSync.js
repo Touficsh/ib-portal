@@ -25,71 +25,17 @@
  */
 import pool from '../db/pool.js';
 import { bridgeRequest, Mt5PausedError } from './mt5BridgeGate.js';
+import {
+  getMt5VolumeDivisor as getVolumeDivisor,
+  getMt5ServerTzOffsetSec as getTzOffsetSec,
+  getMt5InitialLookbackMs as getInitialLookbackMs,
+  getMt5EarliestDealDateMs as getEarliestDealDateMs,
+} from './settingsCache.js';
 
 const MT5_BRIDGE = process.env.MT5_BRIDGE_URL || 'http://localhost:5555';
 const CONCURRENCY = 8;
 const BRIDGE_TIMEOUT_MS = 8000;
-const DEFAULT_VOLUME_DIVISOR = 10000;     // MT5 native volume units → lots
-// First-sync lookback window. Only applies when a login has no cached deals
-// yet — subsequent syncs use the incremental cursor from MAX(deal_time).
-// Default 60 days keeps first-sync fetch cheap; admins can extend per-login
-// via POST /api/admin/mt5-sync/backfill/:login?days=N when an agent needs
-// deeper history. Setting key `mt5_initial_lookback_days` lets this be
-// tuned at runtime without a redeploy.
-const DEFAULT_LOOKBACK_DAYS = 60;
-const WIDE_FUTURE_MS   =  1 * 365 * 24 * 60 * 60 * 1000;  // to= a bit in the future just in case
-
-async function getVolumeDivisor() {
-  try {
-    const { rows } = await pool.query(
-      "SELECT value FROM settings WHERE key = 'mt5_volume_divisor'"
-    );
-    const n = Number(rows[0]?.value);
-    return Number.isFinite(n) && n > 0 ? n : DEFAULT_VOLUME_DIVISOR;
-  } catch {
-    return DEFAULT_VOLUME_DIVISOR;
-  }
-}
-
-// Resolve first-sync lookback window in ms. Reads settings.mt5_initial_lookback_days
-// (configurable at runtime). Falls back to DEFAULT_LOOKBACK_DAYS if unset/invalid.
-async function getInitialLookbackMs() {
-  try {
-    const { rows } = await pool.query(
-      "SELECT value FROM settings WHERE key = 'mt5_initial_lookback_days'"
-    );
-    const n = Number(rows[0]?.value);
-    const days = Number.isFinite(n) && n > 0 ? n : DEFAULT_LOOKBACK_DAYS;
-    return days * 24 * 60 * 60 * 1000;
-  } catch {
-    return DEFAULT_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
-  }
-}
-
-/**
- * Global "earliest deal date" floor. Any deal older than this is never
- * fetched from the bridge and never written to mt5_deal_cache — caps
- * storage + ingress at the source.
- *
- * Stored as `settings.mt5_earliest_deal_date` (YYYY-MM-DD). Returns the
- * timestamp in milliseconds, or null if the floor is not configured.
- *
- * Every code path that decides the bridge `from` timestamp calls this and
- * clamps up (i.e. `from = max(computed_from, floor)`).
- */
-async function getEarliestDealDateMs() {
-  try {
-    const { rows } = await pool.query(
-      "SELECT value FROM settings WHERE key = 'mt5_earliest_deal_date'"
-    );
-    const v = (rows[0]?.value || '').trim();
-    if (!v) return null;
-    const t = new Date(v).getTime();
-    return Number.isFinite(t) ? t : null;
-  } catch {
-    return null;
-  }
-}
+const WIDE_FUTURE_MS = 1 * 365 * 24 * 60 * 60 * 1000;  // to= a bit in the future just in case
 
 async function bridgeFetch(path) {
   // Routed through mt5BridgeGate (rate-limit, concurrency cap, kill switch,
@@ -126,6 +72,7 @@ async function bridgeFetch(path) {
 export async function syncForLogin(login, { volumeDivisor, overrideLookbackDays, overrideFromDate } = {}) {
   if (!login) return { ok: false, reason: 'no-login' };
   const divisor = volumeDivisor || (await getVolumeDivisor());
+  const tzOffsetSec = await getTzOffsetSec();
 
   // Decide the effective `from` timestamp in this order:
   //   1. overrideFromDate      — admin chose an explicit start date in the UI
@@ -188,10 +135,11 @@ export async function syncForLogin(login, { volumeDivisor, overrideLookbackDays,
     const trades = Array.isArray(hist.value?.trades) ? hist.value.trades : [];
     for (const t of trades) {
       if (!t?.dealId || !t?.time) continue;
-      // Belt-and-braces floor check: if the bridge sent a deal older than
-      // our floor (bridge bug, from/to honored loosely, etc.), drop it
-      // here before it gets written to mt5_deal_cache.
-      if (floorMs != null && Number(t.time) * 1000 < floorMs) continue;
+      // Convert broker-local time to UTC by subtracting the configured
+      // tzOffsetSec. Then floor-check the converted UTC time, so the floor
+      // is interpreted in real UTC (consistent with the user-facing setting).
+      const utcTimeMs = (Number(t.time) - tzOffsetSec) * 1000;
+      if (floorMs != null && utcTimeMs < floorMs) continue;
       const entry = Number(t.entry);
       const volume = Number(t.volume) || 0;
       // Only entry=0 (open leg) contributes to "lots traded" — avoids
@@ -199,7 +147,7 @@ export async function syncForLogin(login, { volumeDivisor, overrideLookbackDays,
       const lots = entry === 0 && volume > 0 ? Number((volume / divisor).toFixed(4)) : null;
       dealRows.push({
         deal_id: Number(t.dealId),
-        deal_time: new Date(Number(t.time) * 1000).toISOString(),
+        deal_time: new Date(utcTimeMs).toISOString(),
         entry: Number.isFinite(entry) ? entry : null,
         volume,
         lots,
@@ -215,13 +163,14 @@ export async function syncForLogin(login, { volumeDivisor, overrideLookbackDays,
     const txs = Array.isArray(tx.value?.transactions) ? tx.value.transactions : [];
     for (const x of txs) {
       if (!x?.dealId || !x?.time) continue;
+      const utcTimeMs = (Number(x.time) - tzOffsetSec) * 1000;
       // Same floor check for balance transactions (deposits/withdrawals).
-      if (floorMs != null && Number(x.time) * 1000 < floorMs) continue;
+      if (floorMs != null && utcTimeMs < floorMs) continue;
       const t = String(x.type || '').toLowerCase();
       if (t !== 'deposit' && t !== 'withdrawal') continue;
       dealRows.push({
         deal_id: Number(x.dealId),
-        deal_time: new Date(Number(x.time) * 1000).toISOString(),
+        deal_time: new Date(utcTimeMs).toISOString(),
         entry: null,
         volume: null,
         lots: null,

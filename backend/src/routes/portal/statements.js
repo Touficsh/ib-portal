@@ -21,10 +21,16 @@
 import { Router } from 'express';
 import PDFDocument from 'pdfkit';
 import pool from '../../db/pool.js';
-import { portalAuthenticate, requireAgentAccess } from '../../middleware/portalAuth.js';
+import { portalAuthenticate, requireAgentAccess, requirePortalPermission } from '../../middleware/portalAuth.js';
 
 const router = Router();
-router.use(portalAuthenticate, requireAgentAccess);
+// Statement download piggybacks on the same permission as the Commissions tab —
+// if you can't view your commissions in the UI, you can't download them as PDF either.
+router.use(
+  portalAuthenticate,
+  requireAgentAccess,
+  requirePortalPermission('portal.commissions.view')
+);
 
 function parseDate(v, fallback) {
   if (!v) return fallback;

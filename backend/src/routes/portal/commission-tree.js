@@ -18,11 +18,15 @@
  */
 import { Router } from 'express';
 import pool from '../../db/pool.js';
-import { portalAuthenticate, requireAgentAccess } from '../../middleware/portalAuth.js';
+import { portalAuthenticate, requireAgentAccess, requirePortalPermission } from '../../middleware/portalAuth.js';
 import { wrap as cacheWrap } from '../../services/cache.js';
 
 const router = Router();
-router.use(portalAuthenticate, requireAgentAccess);
+router.use(
+  portalAuthenticate,
+  requireAgentAccess,
+  requirePortalPermission('portal.commission_tree.view')
+);
 
 // 60s per-viewer cache — same TTL as the admin /hierarchy endpoint so this
 // doesn't become the bottleneck for repeated page loads.
@@ -142,6 +146,7 @@ async function buildTreePayload(viewerId) {
       effectivePerLot = crmLevel.override_commission_per_lot != null
         ? crmLevel.override_commission_per_lot
         : crmLevel.commission_per_lot;
+      // Effective $/lot = (commission_percentage% of product base) + fixed rebate per lot
       effectiveRatePerLot = Number((effectivePct * brokerPerLot / 100 + effectivePerLot).toFixed(4));
     }
 

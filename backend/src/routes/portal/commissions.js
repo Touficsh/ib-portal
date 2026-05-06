@@ -18,10 +18,12 @@
  */
 import { Router } from 'express';
 import pool from '../../db/pool.js';
-import { portalAuthenticate } from '../../middleware/portalAuth.js';
+import { portalAuthenticate, requirePortalPermission } from '../../middleware/portalAuth.js';
 
 const router = Router();
-router.use(portalAuthenticate);
+// Whole router gated by 'portal.commissions.view'. Admins bypass via
+// requirePortalPermission's built-in portal.admin shortcut.
+router.use(portalAuthenticate, requirePortalPermission('portal.commissions.view'));
 
 function parseDateParam(val) {
   if (!val) return null;

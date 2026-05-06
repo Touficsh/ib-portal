@@ -6,8 +6,10 @@
  * (volume, commission totals, etc.) will live in /api/portal/dashboard in Phase 2.
  */
 import { Router } from 'express';
+import bcrypt from 'bcryptjs';
 import pool from '../../db/pool.js';
 import { portalAuthenticate } from '../../middleware/portalAuth.js';
+import { audit } from '../../services/auditLog.js';
 
 const router = Router();
 
@@ -66,6 +68,48 @@ router.get('/me', portalAuthenticate, async (req, res, next) => {
   } catch (err) {
     next(err);
   }
+});
+
+// POST /api/portal/me/change-password
+// Lets the authenticated user change their own password. Requires the current
+// password as a check (so a hijacked session can't lock the user out by
+// flipping the password). All actions audit-logged.
+//
+// Body: { current_password: string, new_password: string }
+router.post('/me/change-password', portalAuthenticate, async (req, res, next) => {
+  try {
+    const { current_password, new_password } = req.body || {};
+    if (!current_password) return res.status(400).json({ error: 'current_password is required' });
+    if (!new_password || new_password.length < 8) {
+      return res.status(400).json({ error: 'new_password must be at least 8 characters' });
+    }
+    if (current_password === new_password) {
+      return res.status(400).json({ error: 'new_password must differ from current_password' });
+    }
+
+    const { rows: [user] } = await pool.query(
+      `SELECT id, password_hash FROM users WHERE id = $1 AND is_active = true`,
+      [req.user.id]
+    );
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    const ok = await bcrypt.compare(current_password, user.password_hash || '');
+    if (!ok) return res.status(401).json({ error: 'Current password is incorrect' });
+
+    const newHash = await bcrypt.hash(new_password, 10);
+    await pool.query(
+      `UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2`,
+      [newHash, req.user.id]
+    );
+
+    await audit(req, {
+      action: 'portal.me.change_password',
+      entity_type: 'user',
+      entity_id: req.user.id,
+    });
+
+    res.json({ ok: true });
+  } catch (err) { next(err); }
 });
 
 export default router;

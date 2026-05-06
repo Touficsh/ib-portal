@@ -23,16 +23,20 @@ import { audit } from '../../services/auditLog.js';
 import { runCommissionSync } from '../../services/commissionEngine.js';
 import { syncForLogin as syncMt5ForLogin } from '../../services/mt5SnapshotSync.js';
 import { cacheMw, invalidateCache } from '../../services/responseCache.js';
+import { getWebhookStats, getCommissionQueueDepth } from '../mt5Webhook.js';
+import { getEngineStatus } from '../../services/commissionEngine.js';
+import { getMt5SweepStatus } from '../../services/mt5SyncScheduler.js';
+import { getMt5HotSweepStatus } from '../../services/mt5HotLoginSweep.js';
 
 const router = Router();
 router.use(authenticate, requirePermission('portal.admin'));
 
 // GET /api/admin/mt5-sync/status
-// 45s cache — the page auto-refreshes every 30s, so a 45s TTL means every
-// 2nd/3rd refresh hits the cache instead of re-running 8 parallel aggregate
-// queries. Without this, each refresh was burning ~20s of DB time.
+// 5s cache — the page auto-refreshes every 30s, but the real-time deal-stream
+// counters update every second, so we want the dashboard to feel fresh.
+// 5s is enough to absorb burst clicks (Refresh) without pummeling the DB.
 // "Run cycle now" invalidates the cache below for instant feedback.
-router.get('/status', cacheMw({ ttl: 45 }), async (req, res, next) => {
+router.get('/status', cacheMw({ ttl: 5 }), async (req, res, next) => {
   try {
     // Run all independent queries in parallel — each one is a simple read
     const [
@@ -185,10 +189,42 @@ router.get('/status', cacheMw({ ttl: 45 }), async (req, res, next) => {
         stats_24h: cycleStats24h.rows[0],
       },
 
+      // In-process scheduler timing — what's queued to run and when.
+      // Each entry has: name, label, intervalMs, lastRunAt, nextRunAt.
+      // Frontend renders a "Background schedulers" card showing countdown.
+      schedulers: [
+        {
+          key:   'commission_engine',
+          label: 'Commission engine cycle',
+          purpose: 'Backstop for missed real-time deals; also handles brand-new logins.',
+          ...getEngineStatus(),
+        },
+        {
+          key:   'mt5_active_sweep',
+          label: 'MT5 active-login sweep',
+          purpose: 'Pulls fresh balance + history for every login active in the last 7 days.',
+          ...getMt5SweepStatus(),
+        },
+        {
+          key:   'mt5_hot_sweep',
+          label: 'MT5 hot-login sweep',
+          purpose: 'Faster sub-window for logins active in the last 24 h.',
+          ...getMt5HotSweepStatus(),
+        },
+      ],
+
       deal_cache: {
         ...cacheTotals.rows[0],
         minutes_since_newest_deal: minutesSinceLastDeal,
         activity: cacheWindow.rows[0],
+      },
+
+      // Real-time webhook stream — populated by routes/mt5Webhook.js as
+      // the bridge POSTs deals. In-memory counters since process start;
+      // for absolute totals use deal_cache.activity above.
+      webhook_stream: {
+        ...getWebhookStats(),
+        commission_queue_depth: getCommissionQueueDepth(),
       },
 
       trading_accounts: tradingAccountState.rows[0],
@@ -196,6 +232,75 @@ router.get('/status', cacheMw({ ttl: 45 }), async (req, res, next) => {
       recent_failures: recentJobFailures.rows,
 
       branch_freshness: branchFreshness.rows,
+    });
+  } catch (err) { next(err); }
+});
+
+/**
+ * GET /api/admin/mt5-sync/cycles/:cycleId
+ *
+ * Drill-down for one engine cycle. Surfaces:
+ *   - cycle metadata (started/finished/status/triggered_by)
+ *   - job-status histogram (queued/running/succeeded/failed/dead)
+ *   - distinct error reasons across failed/dead jobs (top 10 by count)
+ *   - up to 50 example failures (login + last_error)
+ *
+ * Used by the "click a cycle row to see what happened" UI on System Health.
+ * One round-trip — three queries fired in parallel against the same cycle id.
+ */
+router.get('/cycles/:cycleId', async (req, res, next) => {
+  try {
+    const cycleId = req.params.cycleId;
+    if (!cycleId) return res.status(400).json({ error: 'cycleId required' });
+
+    const [cycle, jobStats, errorGroups, sampleFailures] = await Promise.all([
+      pool.query(
+        `SELECT id, status, started_at, finished_at,
+                jobs_total, jobs_succeeded, jobs_failed, jobs_dead, deals_inserted,
+                triggered_by, triggered_by_user, since_iso,
+                EXTRACT(EPOCH FROM (COALESCE(finished_at, NOW()) - started_at))::int AS duration_s
+           FROM commission_engine_cycles WHERE id = $1`,
+        [cycleId]
+      ),
+      pool.query(
+        `SELECT status, COUNT(*)::int AS n
+           FROM commission_engine_jobs
+          WHERE cycle_id = $1
+          GROUP BY status`,
+        [cycleId]
+      ),
+      pool.query(
+        `SELECT COALESCE(last_error, '(no error recorded)') AS reason,
+                COUNT(*)::int AS n
+           FROM commission_engine_jobs
+          WHERE cycle_id = $1 AND status IN ('failed', 'dead')
+          GROUP BY reason
+          ORDER BY n DESC
+          LIMIT 10`,
+        [cycleId]
+      ),
+      pool.query(
+        `SELECT j.login, j.client_id, j.product_id, j.status, j.attempt,
+                j.last_error, j.started_at, j.finished_at,
+                cl.name AS client_name
+           FROM commission_engine_jobs j
+           LEFT JOIN clients cl ON cl.id = j.client_id
+          WHERE j.cycle_id = $1 AND j.status IN ('failed', 'dead')
+          ORDER BY j.finished_at DESC NULLS LAST
+          LIMIT 50`,
+        [cycleId]
+      ),
+    ]);
+
+    if (cycle.rows.length === 0) {
+      return res.status(404).json({ error: 'cycle not found', cycleId });
+    }
+
+    res.json({
+      cycle: cycle.rows[0],
+      job_stats: jobStats.rows,
+      error_groups: errorGroups.rows,
+      sample_failures: sampleFailures.rows,
     });
   } catch (err) { next(err); }
 });
