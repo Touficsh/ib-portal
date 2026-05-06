@@ -4,7 +4,8 @@ import {
   AlertCircle, CheckCircle2, Package, CornerUpLeft, UsersRound, Ban, Filter as FilterIcon,
   LayoutList, LayoutGrid,
 } from 'lucide-react';
-import { useApi } from '../../hooks/useApi.js';
+import { useApi, useAutoRefresh } from '../../hooks/useApi.js';
+import LastUpdated from '../../components/LastUpdated.jsx';
 
 /**
  * Admin — Agent Network
@@ -254,26 +255,47 @@ export default function AgentNetwork() {
   const [branchFilter, setBranchFilter] = useState('');
   const [textFilter, setTextFilter] = useState('');
   const [statusMode, setStatusMode] = useState('all');
+  const [clientCountFilter, setClientCountFilter] = useState('all');
   const [expandedMap, setExpandedMap] = useState({});
 
-  const { data, loading } = useApi(
+  const { data, loading, refetch, dataAt } = useApi(
     '/api/agents/hierarchy',
     { query: { branch: branchFilter || undefined } },
     [branchFilter]
   );
   const { data: branches } = useApi('/api/agents/branches-with-counts', {}, []);
+  // Auto-refresh every 45 s + on tab refocus. Without this, edits made on
+  // Commission Tree (which writes to the same agent_products table) wouldn't
+  // appear here until the admin manually reloaded the page.
+  useAutoRefresh(refetch, 45_000);
 
   const roots = data?.roots || [];
   const bucketCounts = useMemo(() => countBuckets(roots), [roots]);
 
-  // Text + (detailed-mode) status filter.
+  // Predicate for the client-count bucket the user picked. Counts only the
+  // agent's DIRECT clients (not the subtree total). Returns true to keep.
+  const clientCountFn = (node) => {
+    const n = Number(node.direct_clients_count || 0);
+    switch (clientCountFilter) {
+      case 'zero':    return n === 0;
+      case 'lt10':    return n > 0 && n < 10;
+      case 'lt20':    return n > 0 && n < 20;
+      case 'gte10':   return n >= 10;
+      case 'gte20':   return n >= 20;
+      case 'gte50':   return n >= 50;
+      default:        return true;  // 'all'
+    }
+  };
+
+  // Text + (detailed-mode) status filter + client-count bucket filter.
   // Returns a Set<id> of visible node ids (null means "no filters active — show all").
   const visibleIds = useMemo(() => {
     const statusFn = STATUS_FILTERS[statusMode]?.match || (() => true);
     const q = textFilter.trim().toLowerCase();
     const hasText = !!q;
     const hasStatus = mode === 'detailed' && statusMode !== 'all';
-    if (!hasText && !hasStatus) return null;
+    const hasClientCount = clientCountFilter !== 'all';
+    if (!hasText && !hasStatus && !hasClientCount) return null;
 
     const visible = new Set();
     function textMatch(node) {
@@ -287,20 +309,22 @@ export default function AgentNetwork() {
       for (const c of (node.children || [])) addSubtree(c);
     }
     function walk(node, depth, ancestors) {
-      const hits = textMatch(node) && (!hasStatus || statusFn(node, depth));
+      const hits = textMatch(node)
+        && (!hasStatus || statusFn(node, depth))
+        && (!hasClientCount || clientCountFn(node));
       if (hits) {
         ancestors.forEach(a => visible.add(a));
         // When only a text filter is active, also reveal the subtree so you
-        // get context around the match. When a status filter is applied we
+        // get context around the match. When status or client-count is on,
         // keep it tight to the matching node.
-        if (hasText && !hasStatus) addSubtree(node);
+        if (hasText && !hasStatus && !hasClientCount) addSubtree(node);
         else visible.add(node.id);
       }
       for (const c of (node.children || [])) walk(c, depth + 1, [...ancestors, node.id]);
     }
     roots.forEach(r => walk(r, 0, []));
     return visible;
-  }, [roots, textFilter, statusMode, mode]);
+  }, [roots, textFilter, statusMode, mode, clientCountFilter]);
 
   const filteredRoots = useMemo(() => {
     if (!visibleIds) return roots;
@@ -339,6 +363,7 @@ export default function AgentNetwork() {
           </p>
         </div>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+          <LastUpdated dataAt={dataAt} loading={loading} />
           {/* Mode toggle */}
           <div
             role="tablist"
@@ -458,17 +483,32 @@ export default function AgentNetwork() {
               onChange={e => setTextFilter(e.target.value)}
               style={{ width: 320 }}
             />
-            {(textFilter || statusMode !== 'all') && (
+            <select
+              className="input"
+              value={clientCountFilter}
+              onChange={e => setClientCountFilter(e.target.value)}
+              title="Filter agents by their direct client count"
+              style={{ width: 200 }}
+            >
+              <option value="all">All client counts</option>
+              <option value="zero">No direct clients</option>
+              <option value="lt10">Less than 10 clients</option>
+              <option value="lt20">Less than 20 clients</option>
+              <option value="gte10">10+ clients</option>
+              <option value="gte20">20+ clients</option>
+              <option value="gte50">50+ clients</option>
+            </select>
+            {(textFilter || statusMode !== 'all' || clientCountFilter !== 'all') && (
               <button
                 className="btn ghost small"
-                onClick={() => { setTextFilter(''); setStatusMode('all'); }}
+                onClick={() => { setTextFilter(''); setStatusMode('all'); setClientCountFilter('all'); }}
               >
                 Clear filters
               </button>
             )}
             <div className="muted small" style={{ marginLeft: 'auto' }}>
-              {(textFilter || statusMode !== 'all')
-                ? `${filteredRoots.length} top-level visible${mode === 'detailed' && statusMode !== 'all' ? ` · ${STATUS_FILTERS[statusMode].label}` : ''}`
+              {(textFilter || statusMode !== 'all' || clientCountFilter !== 'all')
+                ? `${filteredRoots.length} top-level visible${mode === 'detailed' && statusMode !== 'all' ? ` · ${STATUS_FILTERS[statusMode].label}` : ''}${clientCountFilter !== 'all' ? ` · ${clientCountFilter === 'zero' ? '0 clients' : clientCountFilter.replace('lt','<').replace('gte','≥')} clients` : ''}`
                 : ''}
             </div>
           </div>

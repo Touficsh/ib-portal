@@ -85,11 +85,29 @@ function analyzeProduct(agent, product) {
   };
 }
 
-function ProductDetail({ product, agent }) {
+function ProductDetail({ product, agent, parentProduct = null, parentExists = false }) {
   const [expanded, setExpanded] = useState(false);
   const { subs, absorbed, override, orphan } = analyzeProduct(agent, product);
   const hasChildren = subs.length > 0;
   const useCrm = product.has_crm_config;
+
+  // Cascade-violation: my rate > parent's rate (or parent doesn't hold this product)
+  const myRate = Number(
+    product.effective_rate_per_lot != null
+      ? product.effective_rate_per_lot
+      : (product.rate_per_lot || 0)
+  );
+  const parentRate = parentProduct
+    ? Number(parentProduct.effective_rate_per_lot != null
+        ? parentProduct.effective_rate_per_lot
+        : (parentProduct.rate_per_lot || 0))
+    : null;
+  const violatesParent =
+    parentExists && myRate > 0 && (parentProduct == null || parentRate < myRate);
+  const violationTitle = !violatesParent ? null
+    : parentProduct == null
+      ? `Parent agent does not hold ${product.name} — sub-agent should not exceed $0/lot`
+      : `Sub-agent rate $${money(myRate)}/lot exceeds parent's $${money(parentRate)}/lot — cascade violation`;
 
   return (
     <div className="ct-product-card">
@@ -112,8 +130,16 @@ function ProductDetail({ product, agent }) {
             >
               {product.effective_pct}% + ${money(product.effective_per_lot)}
             </span>
-            <span className="mono small" style={{ color: 'var(--success)', fontWeight: 600 }} title="Effective $/lot — pct × broker commission + flat rebate">
-              ≈ ${money(product.effective_rate_per_lot)}/lot
+            <span
+              className={`mono small${violatesParent ? ' ct-rate-violates' : ''}`}
+              style={violatesParent
+                ? { color: 'var(--danger)', fontWeight: 700 }
+                : { color: 'var(--success)', fontWeight: 600 }}
+              title={violatesParent
+                ? violationTitle
+                : 'Effective $/lot — pct × broker commission + flat rebate'}
+            >
+              {violatesParent && '⚠ '}≈ ${money(product.effective_rate_per_lot)}/lot
             </span>
             <span className="pill stage-active" style={{ fontSize: 9, padding: '1px 5px' }} title="Source: synced from xdev CRM">
               CRM
@@ -121,10 +147,27 @@ function ProductDetail({ product, agent }) {
           </>
         ) : (
           <>
-            <span className="ct-rate mono" title="Per-lot rate (legacy — not yet synced from CRM)">
-              ${money(product.rate_per_lot)}/lot
+            <span
+              className={`ct-rate mono${violatesParent ? ' ct-rate-violates' : ''}`}
+              title={violatesParent ? violationTitle : 'Per-lot rate — no CRM commission level configured for this agent on this product'}
+            >
+              {violatesParent && '⚠ '}${money(product.rate_per_lot)}/lot
             </span>
             <span className="muted small">max ${money(product.max_rate_per_lot)}</span>
+            <span
+              className="pill"
+              style={{
+                fontSize: 9,
+                padding: '1px 5px',
+                background: 'color-mix(in srgb, var(--warn) 15%, transparent)',
+                color: 'var(--warn)',
+                border: '1px solid color-mix(in srgb, var(--warn) 35%, transparent)',
+                fontWeight: 600,
+              }}
+              title="No CRM commission_level row exists for this (agent, product). Rate shown is a local default. Configure in xdev CRM to make it authoritative."
+            >
+              ⚠ No CRM config
+            </span>
           </>
         )}
         {hasChildren && (
@@ -212,12 +255,17 @@ function ProductDetail({ product, agent }) {
   );
 }
 
-function AgentNode({ node, depth, earningsById, initiallyOpen = false, autoExpand = false, highlight = '' }) {
+function AgentNode({ node, depth, earningsById, initiallyOpen = false, autoExpand = false, highlight = '', parentProductsById = null }) {
   const [open, setOpen] = useState(initiallyOpen || depth === 0);
   const hasChildren = (node.children || []).length > 0;
   const products = node.products || [];
   const earnings = earningsById.get(node.id);
   const total = earnings?.total_amount || 0;
+
+  const myProductsById = useMemo(
+    () => new Map(products.map(p => [p.product_id, p])),
+    [products]
+  );
 
   useEffect(() => {
     if (autoExpand) setOpen(true);
@@ -263,6 +311,11 @@ function AgentNode({ node, depth, earningsById, initiallyOpen = false, autoExpan
               {(node.name || '?')[0].toUpperCase()}
             </div>
             <span className="ct-agent-name">{renderName()}</span>
+            {node.email && (
+              <span className="muted small" style={{ marginLeft: 6 }} title={node.email}>
+                {node.email}
+              </span>
+            )}
             <span className="ct-agent-earnings" title="Total commission earned (all time)">
               <DollarSign size={11} style={{ verticalAlign: -1 }} />
               {moneyShort(total)}
@@ -287,7 +340,13 @@ function AgentNode({ node, depth, earningsById, initiallyOpen = false, autoExpan
           ) : (
             <div className="ct-products">
               {products.map(p => (
-                <ProductDetail key={p.product_id} product={p} agent={node} />
+                <ProductDetail
+                  key={p.product_id}
+                  product={p}
+                  agent={node}
+                  parentProduct={parentProductsById ? parentProductsById.get(p.product_id) : null}
+                  parentExists={parentProductsById !== null}
+                />
               ))}
             </div>
           )}
@@ -304,6 +363,7 @@ function AgentNode({ node, depth, earningsById, initiallyOpen = false, autoExpan
               initiallyOpen={false}
               autoExpand={autoExpand}
               highlight={highlight}
+              parentProductsById={myProductsById}
             />
           ))}
         </div>

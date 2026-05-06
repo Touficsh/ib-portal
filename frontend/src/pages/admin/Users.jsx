@@ -1,15 +1,19 @@
 import { useState } from 'react';
-import { useApi, useMutation } from '../../hooks/useApi.js';
+import { useApi, useMutation, useAutoRefresh } from '../../hooks/useApi.js';
 import { toast, confirm } from '../../components/ui/toast.js';
+import LastUpdated from '../../components/LastUpdated.jsx';
 
 /**
  * Admin — Users — lists all CRM users and promotes them to agent.
  * Hits /api/users (admin route) and /api/agents/:id/promote.
  */
 export default function AdminUsers() {
-  const { data: users, loading, refetch } = useApi('/api/users', {}, []);
+  const { data: users, loading, refetch, dataAt } = useApi('/api/users', {}, []);
   const { data: agents } = useApi('/api/agents', {}, []);
   const { data: products } = useApi('/api/products', {}, []);
+  // Auto-refresh every 60s + on tab refocus. Picks up changes from another
+  // admin granting a permission or promoting a user.
+  useAutoRefresh(refetch, 60_000);
 
   const [pickedUser, setPickedUser] = useState(null);
   const [parentId, setParentId] = useState('');
@@ -18,6 +22,38 @@ export default function AdminUsers() {
 
   const [promote, { loading: promoting }] = useMutation();
   const [demote, { loading: demoting }] = useMutation();
+  const [resetPw, { loading: resettingPw }] = useMutation();
+  const [pwUserId, setPwUserId] = useState(null);   // null when modal closed
+  const [pwValue, setPwValue] = useState('');
+  const [pwShow, setPwShow] = useState(false);
+
+  function openPwModal(user) {
+    setPwUserId(user.id);
+    setPwValue('');
+    setPwShow(false);
+  }
+  function closePwModal() {
+    setPwUserId(null);
+    setPwValue('');
+  }
+  async function submitPwReset(e) {
+    e?.preventDefault?.();
+    if (pwValue.length < 8) {
+      toast.error('Password must be at least 8 characters');
+      return;
+    }
+    const user = (users || []).find(u => u.id === pwUserId);
+    try {
+      await resetPw(`/api/users/${pwUserId}/reset-password`, {
+        method: 'POST',
+        body: { password: pwValue },
+      });
+      toast.success(`Password reset for ${user?.name || 'user'}`);
+      closePwModal();
+    } catch (err) {
+      toast.error(err.message || 'Reset failed');
+    }
+  }
 
   function addProductAssignment() {
     setProductAssignments(list => [...list, { product_id: '', rate_per_lot: '' }]);
@@ -78,6 +114,9 @@ export default function AdminUsers() {
             see <a href="/portal/admin/import-agents" className="link-accent">Import Agents</a>.
           </p>
         </div>
+        <div style={{ paddingTop: 6 }}>
+          <LastUpdated dataAt={dataAt} loading={loading} />
+        </div>
       </header>
 
       {notice && <div className={`alert ${notice.kind}`}>{notice.text}</div>}
@@ -102,7 +141,14 @@ export default function AdminUsers() {
                   <td>{u.role}</td>
                   <td>{isAgent ? <span className="pill stage-active">Agent</span> : '—'}</td>
                   <td>{u.is_active ? 'Active' : 'Inactive'}</td>
-                  <td className="num">
+                  <td className="num" style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
+                    <button
+                      className="btn ghost small"
+                      onClick={() => openPwModal(u)}
+                      title="Set a new password for this user"
+                    >
+                      Reset password
+                    </button>
                     {isAgent ? (
                       <button className="btn ghost small" disabled={demoting} onClick={() => onDemote(u)}>Demote</button>
                     ) : (
@@ -115,6 +161,67 @@ export default function AdminUsers() {
           </tbody>
         </table>
       </div>
+
+      {/* Password reset modal — opens when admin clicks "Reset password" on
+          any row. Plain centered card overlay; closes on Cancel or success. */}
+      {pwUserId && (
+        <div
+          onClick={(e) => { if (e.target === e.currentTarget) closePwModal(); }}
+          style={{
+            position: 'fixed', inset: 0, zIndex: 1000,
+            background: 'rgba(0,0,0,0.5)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            padding: 20,
+          }}
+        >
+          <form
+            onSubmit={submitPwReset}
+            className="card"
+            style={{ width: '100%', maxWidth: 420, margin: 0 }}
+          >
+            <div className="card-header">
+              <h2 style={{ margin: 0 }}>
+                Reset password — {(users || []).find(u => u.id === pwUserId)?.name}
+              </h2>
+              <button type="button" className="btn ghost small" onClick={closePwModal}>Cancel</button>
+            </div>
+            <div className="pad">
+              <label className="field">
+                <span>New password (min 8 chars)</span>
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <input
+                    autoFocus
+                    type={pwShow ? 'text' : 'password'}
+                    className="input"
+                    value={pwValue}
+                    onChange={e => setPwValue(e.target.value)}
+                    minLength={8}
+                    required
+                    style={{ flex: 1 }}
+                  />
+                  <button
+                    type="button"
+                    className="btn ghost small"
+                    onClick={() => setPwShow(s => !s)}
+                    title={pwShow ? 'Hide' : 'Show'}
+                  >
+                    {pwShow ? 'Hide' : 'Show'}
+                  </button>
+                </div>
+              </label>
+              <p className="muted small" style={{ marginTop: 8 }}>
+                The user can sign in with this immediately. Hand it to them through a secure channel.
+              </p>
+              <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 12 }}>
+                <button type="button" className="btn ghost" onClick={closePwModal}>Cancel</button>
+                <button type="submit" className="btn primary" disabled={resettingPw || pwValue.length < 8}>
+                  {resettingPw ? 'Resetting…' : 'Set new password'}
+                </button>
+              </div>
+            </div>
+          </form>
+        </div>
+      )}
 
       {pickedUser && (
         <section className="card">

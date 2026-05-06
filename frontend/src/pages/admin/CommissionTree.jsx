@@ -4,8 +4,10 @@ import {
   AlertTriangle, ArrowDown, Info, DollarSign, Trophy, Pencil, Check, X, Search,
   RefreshCw, CloudDownload,
 } from 'lucide-react';
-import { useApi, useMutation } from '../../hooks/useApi.js';
+import { useApi, useMutation, useAutoRefresh } from '../../hooks/useApi.js';
 import { toast, confirm } from '../../components/ui/toast.js';
+import JobProgressModal from '../../components/JobProgressModal.jsx';
+import LastUpdated from '../../components/LastUpdated.jsx';
 
 /**
  * Admin — Commission Tree (per branch)
@@ -234,7 +236,28 @@ function EditableRate({ agentId, product, onSaved }) {
   );
 }
 
-function ProductDetail({ product, agent, onRateChanged }) {
+function ProductDetail({ product, agent, onRateChanged, parentProduct = null, parentExists = false }) {
+  // Cascade-violation check (per-product, per-agent vs direct parent):
+  //   1. Parent has a parent_agent_id (parentExists) AND
+  //   2. Either parent doesn't hold this product at all, OR
+  //      parent's effective $/lot < this agent's effective $/lot
+  // Compare effective_rate_per_lot when CRM-synced; fall back to rate_per_lot.
+  const myRate = Number(
+    product.effective_rate_per_lot != null
+      ? product.effective_rate_per_lot
+      : (product.rate_per_lot || 0)
+  );
+  const parentRate = parentProduct
+    ? Number(parentProduct.effective_rate_per_lot != null
+        ? parentProduct.effective_rate_per_lot
+        : (parentProduct.rate_per_lot || 0))
+    : null;
+  const violatesParent =
+    parentExists && myRate > 0 && (parentProduct == null || parentRate < myRate);
+  const violationTitle = !violatesParent ? null
+    : parentProduct == null
+      ? `Parent agent does not hold ${product.name} — sub-agent should not exceed $0/lot`
+      : `Sub-agent rate $${money(myRate)}/lot exceeds parent's $${money(parentRate)}/lot — cascade violation`;
   const [expanded, setExpanded] = useState(false);
   const { subs, absorbed, override, orphan } = analyzeProduct(agent, product);
   const hasChildren = subs.length > 0;
@@ -262,8 +285,16 @@ function ProductDetail({ product, agent, onRateChanged }) {
             >
               {product.effective_pct}% + ${money(product.effective_per_lot)}
             </span>
-            <span className="mono small" style={{ color: 'var(--success)', fontWeight: 600 }} title="Effective $/lot — pct × broker commission + flat rebate">
-              ≈ ${money(product.effective_rate_per_lot)}/lot
+            <span
+              className={`mono small${violatesParent ? ' ct-rate-violates' : ''}`}
+              style={violatesParent
+                ? { color: 'var(--danger)', fontWeight: 700 }
+                : { color: 'var(--success)', fontWeight: 600 }}
+              title={violatesParent
+                ? violationTitle
+                : 'Effective $/lot — pct × broker commission + flat rebate'}
+            >
+              {violatesParent && '⚠ '}≈ ${money(product.effective_rate_per_lot)}/lot
             </span>
             <span className="pill stage-active" style={{ fontSize: 9, padding: '1px 5px' }} title="Source: synced from xdev CRM. Edit in CRM to change.">
               CRM
@@ -271,9 +302,34 @@ function ProductDetail({ product, agent, onRateChanged }) {
           </>
         ) : (
           <>
-            {/* Legacy: editable rate_per_lot for unsynced branches */}
-            <EditableRate agentId={agent.id} product={product} onSaved={onRateChanged} />
+            {/* No CRM commission_level config for (this agent, this product).
+                The displayed rate comes from agent_products (often a healed
+                default = product max). Surface this so admin knows to go
+                configure the rate in xdev CRM. The local rate is still
+                shown so the operator has context. */}
+            <span
+              className={violatesParent ? 'ct-rate-violates-wrap' : ''}
+              style={violatesParent ? { color: 'var(--danger)' } : undefined}
+              title={violatesParent ? violationTitle : undefined}
+            >
+              {violatesParent && '⚠ '}
+              <EditableRate agentId={agent.id} product={product} onSaved={onRateChanged} />
+            </span>
             <span className="muted small">max ${money(product.max_rate_per_lot)}</span>
+            <span
+              className="pill"
+              style={{
+                fontSize: 9,
+                padding: '1px 5px',
+                background: 'color-mix(in srgb, var(--warn) 15%, transparent)',
+                color: 'var(--warn)',
+                border: '1px solid color-mix(in srgb, var(--warn) 35%, transparent)',
+                fontWeight: 600,
+              }}
+              title="No CRM commission_level row exists for this (agent, product). The rate above is from agent_products (often a healed default — the product max). Configure the agent's rate in xdev CRM to make this authoritative."
+            >
+              ⚠ No CRM config
+            </span>
           </>
         )}
         {hasChildren && (
@@ -382,12 +438,18 @@ function ProductDetail({ product, agent, onRateChanged }) {
   );
 }
 
-function AgentNode({ node, depth, earningsById, onRateChanged, initiallyOpen = false, autoExpand = false, highlight = '' }) {
+function AgentNode({ node, depth, earningsById, onRateChanged, initiallyOpen = false, autoExpand = false, highlight = '', parentProductsById = null }) {
   const [open, setOpen] = useState(initiallyOpen || depth === 0);
   const hasChildren = (node.children || []).length > 0;
   const products = node.products || [];
   const earnings = earningsById.get(node.id);
   const total = earnings?.total_amount || 0;
+
+  // Build my product map once so children can compare against it
+  const myProductsById = useMemo(
+    () => new Map(products.map(p => [p.product_id, p])),
+    [products]
+  );
 
   // When the caller requests auto-expand (e.g. search active), force-open.
   // Still allow the user to collapse after — we only set it on the autoExpand edge.
@@ -437,6 +499,11 @@ function AgentNode({ node, depth, earningsById, onRateChanged, initiallyOpen = f
               {(node.name || '?')[0].toUpperCase()}
             </div>
             <span className="ct-agent-name">{renderName()}</span>
+            {node.email && (
+              <span className="muted small" style={{ marginLeft: 6 }} title={node.email}>
+                {node.email}
+              </span>
+            )}
             <span className="ct-agent-earnings" title="Total commission earned (all time)">
               <DollarSign size={11} style={{ verticalAlign: -1 }} />
               {moneyShort(total)}
@@ -465,6 +532,8 @@ function AgentNode({ node, depth, earningsById, onRateChanged, initiallyOpen = f
                   key={p.product_id}
                   product={p}
                   agent={node}
+                  parentProduct={parentProductsById ? parentProductsById.get(p.product_id) : null}
+                  parentExists={parentProductsById !== null}
                   onRateChanged={onRateChanged}
                 />
               ))}
@@ -484,6 +553,7 @@ function AgentNode({ node, depth, earningsById, onRateChanged, initiallyOpen = f
               initiallyOpen={false}
               autoExpand={autoExpand}
               highlight={highlight}
+              parentProductsById={myProductsById}
             />
           ))}
         </div>
@@ -507,12 +577,17 @@ export default function CommissionTree() {
     }
   }, [branches]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const { data: hier, loading, refetch: refetchHier } = useApi(
+  const { data: hier, loading, refetch: refetchHier, dataAt: hierAt } = useApi(
     selectedBranch ? `/api/agents/hierarchy?branch=${encodeURIComponent(selectedBranch)}` : null,
     {},
     [selectedBranch]
   );
   const { data: earners } = useApi('/api/commissions/earners', {}, []);
+  // Auto-refresh every 45 s + on tab refocus. The page is also explicitly
+  // re-fetched after each rate save (via the inline editor's onSaved
+  // callback), so this mainly catches edits made in another tab / by
+  // another admin while this view is open.
+  useAutoRefresh(refetchHier, 45_000);
 
   // Sync mutations — both wire to existing admin endpoints. Products sync
   // walks every imported agent, upserts links, and (after the recent fix)
@@ -522,6 +597,9 @@ export default function CommissionTree() {
   // legacy single-rate fallback.
   const [runProductSync,   { loading: syncingProducts }]   = useMutation();
   const [runCommLevelSync, { loading: syncingCommLevels }] = useMutation();
+  // Live progress modal — opened during the long syncs above
+  const [progressJobId, setProgressJobId] = useState(null);
+  const [progressTitle, setProgressTitle] = useState('Working…');
 
   async function handleSyncProducts() {
     const ok = await confirm(
@@ -532,13 +610,17 @@ export default function CommissionTree() {
       { confirmLabel: 'Sync products', cancelLabel: 'Cancel' }
     );
     if (!ok) return;
+    const jobId = (crypto.randomUUID && crypto.randomUUID()) || `${Date.now()}-${Math.random()}`;
+    setProgressJobId(jobId);
+    setProgressTitle('Syncing agent product links from CRM');
     try {
-      const r = await runProductSync('/api/agents/sync-products-from-crm', { method: 'POST' });
+      const r = await runProductSync('/api/agents/sync-products-from-crm', { method: 'POST', headers: { 'X-Job-Id': jobId } });
       const msg = `Synced ${r.scannedLinks || 0} CRM links — created ${r.created || 0}, deactivated ${r.deactivated || 0}, preserved ${r.preserved || 0}${r.errors ? ` · ${r.errors} errors` : ''}`;
       toast.success(msg, { duration: 8000 });
       refetchHier();
     } catch (err) {
       toast.error(err.message || 'Product sync failed');
+      setProgressJobId(null);
     }
   }
 
@@ -565,11 +647,14 @@ export default function CommissionTree() {
       { confirmLabel: force ? 'Force full sync' : 'Smart sync', cancelLabel: 'Cancel', variant: force ? 'danger' : undefined }
     );
     if (!ok) return;
+    const jobId = (crypto.randomUUID && crypto.randomUUID()) || `${Date.now()}-${Math.random()}`;
+    setProgressJobId(jobId);
+    setProgressTitle(force ? 'Force-full sync of commission rates' : 'Smart sync of commission rates');
     try {
       const url = force
         ? '/api/agents/sync-commission-levels?staleAfterHours=0'
         : '/api/agents/sync-commission-levels';
-      const r = await runCommLevelSync(url, { method: 'POST' });
+      const r = await runCommLevelSync(url, { method: 'POST', headers: { 'X-Job-Id': jobId } });
       const note = r.note
         || (force
           ? 'Force-full sync started in the background.'
@@ -577,6 +662,7 @@ export default function CommissionTree() {
       toast.success(`${note} Refresh page in ~1 min to see updated rates.`, { duration: 8000 });
     } catch (err) {
       toast.error(err.message || 'Commission-rate sync failed');
+      setProgressJobId(null);
     }
   }
 
@@ -634,11 +720,19 @@ export default function CommissionTree() {
   const stats = useMemo(() => {
     if (!hier?.roots) return null;
     let agents = 0, products = 0, zeroRate = 0, absorbedPairs = 0, overridePairs = 0, orphanPairs = 0;
+    let noCrmConfig = 0;  // (agent, product) pairs lacking a crm_commission_level row
+    const noCrmConfigDetails = [];  // for the banner — first ~5 examples
     function walk(node) {
       agents++;
       for (const p of (node.products || [])) {
         products++;
         if (Number(p.rate_per_lot) === 0) zeroRate++;
+        if (!p.has_crm_config) {
+          noCrmConfig++;
+          if (noCrmConfigDetails.length < 8) {
+            noCrmConfigDetails.push({ agent: node.name, product: p.name, rate: Number(p.rate_per_lot) });
+          }
+        }
         const a = analyzeProduct(node, p);
         overridePairs += a.override;
         absorbedPairs += a.absorbed;
@@ -647,7 +741,7 @@ export default function CommissionTree() {
       (node.children || []).forEach(walk);
     }
     hier.roots.forEach(walk);
-    return { agents, products, zeroRate, absorbedPairs, overridePairs, orphanPairs };
+    return { agents, products, zeroRate, absorbedPairs, overridePairs, orphanPairs, noCrmConfig, noCrmConfigDetails };
   }, [hier]);
 
   // Top 10 earners in this branch (flatten tree + filter to those with earnings)
@@ -679,7 +773,8 @@ export default function CommissionTree() {
         {/* Sync controls — pull fresh product list + rates from x-dev CRM
             without leaving the page. Both fire global syncs (all agents)
             since CRM is the source of truth and the operation is idempotent. */}
-        <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
+        <div style={{ display: 'flex', gap: 6, flexShrink: 0, alignItems: 'center' }}>
+          <LastUpdated dataAt={hierAt} loading={loading} />
           <button
             type="button"
             className="btn ghost small"
@@ -808,6 +903,59 @@ export default function CommissionTree() {
         </section>
       )}
 
+      {/* Banner: products lacking CRM commission_level config — operator
+          should configure these in xdev CRM. Collapsible so it doesn't eat
+          screen real estate after the operator has noted the list.
+          Stored in localStorage so the collapsed state survives refreshes. */}
+      {stats && stats.noCrmConfig > 0 && (
+        <details
+          open={localStorage.getItem('ct.noCrmBannerOpen') !== 'false'}
+          onToggle={(e) => localStorage.setItem('ct.noCrmBannerOpen', e.currentTarget.open ? 'true' : 'false')}
+          style={{
+            margin: '12px 0',
+            padding: '10px 14px',
+            borderRadius: 8,
+            background: 'color-mix(in srgb, var(--warn) 10%, transparent)',
+            border: '1px solid color-mix(in srgb, var(--warn) 35%, transparent)',
+            color: 'var(--warn)',
+          }}
+        >
+          <summary style={{
+            cursor: 'pointer',
+            display: 'flex',
+            gap: 10,
+            alignItems: 'center',
+            fontWeight: 600,
+            color: 'var(--warn)',
+            listStyle: 'none',
+            outline: 'none',
+          }}>
+            <AlertTriangle size={16} style={{ flexShrink: 0 }} />
+            <span>
+              {stats.noCrmConfig} product{stats.noCrmConfig === 1 ? '' : 's'} need CRM commission configuration
+            </span>
+            <span className="muted small" style={{ marginLeft: 'auto', fontWeight: 400 }}>
+              click to expand / collapse
+            </span>
+          </summary>
+          <div className="small" style={{ color: 'var(--text)', marginTop: 8 }}>
+            These (agent, product) pairs show a local rate (often the product's max as a default) but have no <span className="mono">crm_commission_levels</span> entry.
+            Configure them in xdev CRM so the rates flow into the engine authoritatively.
+          </div>
+          <ul style={{ margin: '8px 0 0 0', paddingLeft: 18, color: 'var(--text)', fontSize: 12 }}>
+            {stats.noCrmConfigDetails.map((d, i) => (
+              <li key={i}>
+                <span style={{ fontWeight: 500 }}>{d.agent}</span> · {d.product}
+                <span className="muted" style={{ marginLeft: 6 }}>(local: ${d.rate.toFixed(2)}/lot)</span>
+              </li>
+            ))}
+            {stats.noCrmConfig > stats.noCrmConfigDetails.length && (
+              <li className="muted">… and {stats.noCrmConfig - stats.noCrmConfigDetails.length} more (see ⚠ chips in the tree below)</li>
+            )}
+          </ul>
+        </details>
+      )}
+
       <section className="card">
         <div className="card-header">
           <h2>{selectedBranch} · agent hierarchy</h2>
@@ -864,6 +1012,15 @@ export default function CommissionTree() {
           </div>
         </div>
       </section>
+
+      {/* Live progress modal — opens during Sync products / Sync rates clicks */}
+      {progressJobId && (
+        <JobProgressModal
+          jobId={progressJobId}
+          title={progressTitle}
+          onClose={() => setProgressJobId(null)}
+        />
+      )}
     </div>
   );
 }

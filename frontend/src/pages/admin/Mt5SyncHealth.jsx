@@ -1,7 +1,7 @@
 import { useEffect, useState, useMemo } from 'react';
 import {
   Activity, CheckCircle2, AlertTriangle, XCircle, Pause, Play, RefreshCw,
-  Database, Clock, TrendingUp, Zap, AlertCircle, Server, ChevronRight,
+  Database, Clock, TrendingUp, Zap, AlertCircle, Server, ChevronRight, Radio,
 } from 'lucide-react';
 import { useApi, useMutation } from '../../hooks/useApi.js';
 import { toast } from '../../components/ui/toast.js';
@@ -30,6 +30,41 @@ function humanizeAgo(isoOrDate) {
   if (secs < 3600)    return `${Math.round(secs/60)}m ago`;
   if (secs < 86400)   return `${Math.round(secs/3600)}h ago`;
   return `${Math.round(secs/86400)}d ago`;
+}
+
+// Per-cycle drill-down loader. Returns [data, loading, error, open(id), close()].
+// Lives outside the main component so it stays self-contained and reusable.
+function useCycleDetail() {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const open = async (cycleId) => {
+    if (!cycleId) return;
+    setLoading(true); setError(null);
+    try {
+      const { api } = await import('../../api.js');
+      const res = await api(`/api/admin/mt5-sync/cycles/${cycleId}`);
+      setData(res);
+    } catch (e) {
+      setError(e.message || 'failed to load cycle');
+    } finally {
+      setLoading(false);
+    }
+  };
+  const close = () => { setData(null); setError(null); };
+  return [data, loading, error, open, close];
+}
+
+// Future-looking variant of humanizeAgo. "in 23m", "in 1h", "any moment", etc.
+function humanizeIn(isoOrDate) {
+  if (!isoOrDate) return '—';
+  const then = new Date(isoOrDate).getTime();
+  const secs = Math.round((then - Date.now()) / 1000);
+  if (secs <= 0)      return 'any moment';
+  if (secs < 60)      return `in ${secs}s`;
+  if (secs < 3600)    return `in ${Math.round(secs/60)}m`;
+  if (secs < 86400)   return `in ${Math.round(secs/3600)}h`;
+  return `in ${Math.round(secs/86400)}d`;
 }
 
 function humanizeDuration(secs) {
@@ -75,6 +110,11 @@ export default function Mt5SyncHealth() {
   const [saveFloor,    { loading: savingFloor }]    = useMutation();
   const [lookbackDraft, setLookbackDraft] = useState('');
   const [floorDraft,    setFloorDraft]    = useState('');  // YYYY-MM-DD or ''
+
+  // Per-cycle drill-down: must live ABOVE any conditional early-returns
+  // (e.g. `if (!data) return null` later in this component) — Rules of Hooks
+  // require hook calls in the same order on every render.
+  const [cycleDetail, cycleDetailLoading, cycleDetailError, openCycle, closeCycle] = useCycleDetail();
 
   // Sync the drafts with server-known values whenever /status refreshes
   useEffect(() => {
@@ -165,6 +205,7 @@ export default function Mt5SyncHealth() {
   const act = dc.activity || {};
   const cycles = data.cycles?.recent || [];
   const stats = data.cycles?.stats_24h || {};
+  const ws = data.webhook_stream || {};
 
   return (
     <div>
@@ -200,10 +241,14 @@ export default function Mt5SyncHealth() {
             className={`btn small ${data.bridge_gate?.paused ? '' : 'ghost'}`}
             onClick={togglePause}
             disabled={togglingPause}
+            title={data.bridge_gate?.paused
+              ? 'Resume MT5 activity — outbound bridge calls + incoming webhook deals + per-deal commission writes will all start flowing again'
+              : 'Stop ALL MT5 activity — outbound bridge calls (snapshot sync, /accounts, /history), incoming webhook deals, and per-deal commission writes. Bridge process keeps running but the portal ignores it.'
+            }
           >
             {data.bridge_gate?.paused
-              ? <><Play size={12} /> Resume bridge</>
-              : <><Pause size={12} /> Pause bridge</>
+              ? <><Play size={12} /> Resume MT5</>
+              : <><Pause size={12} /> Pause MT5 (kill switch)</>
             }
           </button>
         </div>
@@ -245,19 +290,158 @@ export default function Mt5SyncHealth() {
         </div>
       </section>
 
+      {/* ── Real-time deal stream ───────────────────────────────────────── */}
+      {/*
+       * In-memory webhook counters from routes/mt5Webhook.js. Resets on
+       * portal restart, so "since restart" totals can be small even when
+       * the cache has millions of rows. The "last N min" buckets are the
+       * real signal — if `last 5 min` is 0 while the broker is open, the
+       * stream is broken (bridge dead, secret mismatch, network blocked).
+       */}
+      <section className="card" style={{ marginBottom: 'var(--space-4)' }}>
+        <div className="card-header">
+          <h2>
+            <Radio size={14} style={{ verticalAlign: -2, marginRight: 6 }} />
+            Real-time deal stream
+          </h2>
+          <span className="muted small">
+            via MT5 bridge → POST /api/mt5/webhook/deal
+          </span>
+        </div>
+        <div
+          className="pad"
+          style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(4, 1fr)',
+            gap: 24,
+          }}
+        >
+          {[
+            { label: 'Last 1 min',  value: ws.last_1min  },
+            { label: 'Last 5 min',  value: ws.last_5min  },
+            { label: 'Last 15 min', value: ws.last_15min },
+            { label: 'Last 60 min', value: ws.last_60min },
+          ].map(b => (
+            <div key={b.label}>
+              <div className="muted small" style={{ textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                {b.label}
+              </div>
+              <div style={{ fontSize: 26, fontWeight: 700, marginTop: 4, lineHeight: 1.1 }}>
+                {fmt(b.value)}
+              </div>
+              <div className="muted small" style={{ marginTop: 2 }}>deals received</div>
+            </div>
+          ))}
+        </div>
+        <div
+          className="pad"
+          style={{
+            paddingTop: 12,
+            borderTop: '1px solid var(--border)',
+            display: 'grid',
+            gridTemplateColumns: 'repeat(3, minmax(0, 1fr))',
+            gap: 16,
+            fontSize: 12,
+            alignItems: 'center',
+          }}
+        >
+          <div className="muted">
+            <span style={{ fontWeight: 500, color: 'var(--text)' }}>Since portal restart: </span>
+            {fmt(ws.total_received)} received · {fmt(ws.total_inserted)} new
+            {ws.total_skipped_unknown ? ` · ${fmt(ws.total_skipped_unknown)} skipped (other broker clients)` : ''}
+            {ws.total_skipped_paused ? ` · ${fmt(ws.total_skipped_paused)} skipped (paused)` : ''}
+            {ws.total_rejected ? ` · ${fmt(ws.total_rejected)} rejected` : ''}
+          </div>
+          <div className="muted">
+            <span style={{ fontWeight: 500, color: 'var(--text)' }}>Last received: </span>
+            {ws.last_received_at ? humanizeAgo(ws.last_received_at) : '—'}
+          </div>
+          <div style={{
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+          }}>
+            {ws.last_error ? (
+              <span style={{ color: 'var(--danger)', display: 'inline-flex', alignItems: 'center', gap: 4 }}
+                    title={ws.last_error}>
+                <AlertTriangle size={12} style={{ flexShrink: 0 }} /> {ws.last_error}
+              </span>
+            ) : (
+              <span style={{ color: 'var(--success)', display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                <CheckCircle2 size={12} style={{ flexShrink: 0 }} /> No errors since restart
+              </span>
+            )}
+          </div>
+        </div>
+
+        {/* ── Recent webhook errors — last N rejected POSTs ──────────── */}
+        {ws.recent_errors && ws.recent_errors.length > 0 && (
+          <div className="pad" style={{
+            paddingTop: 12,
+            borderTop: '1px solid var(--border)',
+            marginTop: 12,
+          }}>
+            <div className="muted small" style={{ fontWeight: 500, marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+              Recent errors (last {ws.recent_errors.length})
+            </div>
+            <table className="table" style={{ fontSize: 12 }}>
+              <thead>
+                <tr>
+                  <th style={{ width: '13%' }}>When</th>
+                  <th style={{ width: '7%' }}>Op</th>
+                  <th style={{ width: '12%' }}>Login</th>
+                  <th style={{ width: '13%' }}>Deal ID</th>
+                  <th>Reason</th>
+                </tr>
+              </thead>
+              <tbody>
+                {ws.recent_errors.slice(0, 10).map((e, i) => (
+                  <tr key={`${e.ts}-${i}`}>
+                    <td className="muted">{humanizeAgo(e.ts)}</td>
+                    <td className="mono small">{e.op || '—'}</td>
+                    <td className="mono small">{e.login || '—'}</td>
+                    <td className="mono small">{e.dealId ?? '—'}</td>
+                    <td style={{ color: 'var(--danger)' }}>{e.reason}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
       {/* ── Bridge gate card ────────────────────────────────────────────── */}
       <section className="card" style={{ marginBottom: 'var(--space-4)' }}>
         <div className="card-header">
           <h2><Server size={14} style={{ verticalAlign: -2, marginRight: 6 }} />MT5 bridge gate</h2>
           <span className="muted small">In-process guardrails for bridge calls</span>
         </div>
-        <div className="pad" style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
+        <div className="pad" style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 12 }}>
           <div>
             <div className="muted small">Status</div>
             <div style={{ fontWeight: 600, fontSize: 15, marginTop: 4 }}>
               {data.bridge_gate.paused
                 ? <span style={{ color: 'var(--danger)' }}>Paused</span>
                 : <span style={{ color: 'var(--success)' }}>Active</span>}
+            </div>
+          </div>
+          <div>
+            <div className="muted small">MT5 session</div>
+            <div style={{ fontWeight: 600, fontSize: 15, marginTop: 4 }}>
+              {data.bridge_gate.mt5_connected === true ? (
+                <span style={{ color: 'var(--success)' }}>
+                  Connected
+                </span>
+              ) : data.bridge_gate.mt5_connected === false ? (
+                <span style={{ color: 'var(--danger)' }}>Disconnected</span>
+              ) : (
+                <span className="muted">Bridge unreachable</span>
+              )}
+            </div>
+            <div className="muted small" style={{ marginTop: 2 }}>
+              {data.bridge_gate.connected_since
+                ? `since ${humanizeAgo(data.bridge_gate.connected_since)}`
+                : ''}
             </div>
           </div>
           <div>
@@ -365,11 +549,60 @@ export default function Mt5SyncHealth() {
         </form>
       </section>
 
+      {/* ── Background schedulers (next-run countdown) ───────────────────── */}
+      {/*
+       * Live state of each in-process scheduler. Lets an admin see at a
+       * glance "when will the next thing fire?" without reading the .env.
+       * Driven by getEngineStatus / getMt5SweepStatus / getMt5HotSweepStatus
+       * exported from each scheduler module.
+       */}
+      {data.schedulers && data.schedulers.length > 0 && (
+        <section className="card" style={{ marginBottom: 'var(--space-4)' }}>
+          <div className="card-header">
+            <h2><Clock size={14} style={{ verticalAlign: -2, marginRight: 6 }} />Background schedulers</h2>
+            <span className="muted small">Next-run countdown for periodic jobs</span>
+          </div>
+          <table className="table" style={{ marginTop: 6 }}>
+            <thead>
+              <tr>
+                <th style={{ width: '24%' }}>Job</th>
+                <th style={{ width: '12%' }}>Frequency</th>
+                <th style={{ width: '14%' }}>Last run</th>
+                <th style={{ width: '14%' }}>Next run</th>
+                <th>Purpose</th>
+              </tr>
+            </thead>
+            <tbody>
+              {data.schedulers.map(s => {
+                const minutes = s.intervalMs ? Math.round(s.intervalMs / 60000) : null;
+                const disabled = s.enabled === false || s.intervalMs == null;
+                return (
+                  <tr key={s.key}>
+                    <td style={{ fontWeight: 500 }}>{s.label}</td>
+                    <td className="muted">{minutes ? `every ${minutes} min` : '—'}</td>
+                    <td className="muted">{s.lastRunAt ? humanizeAgo(s.lastRunAt) : '—'}</td>
+                    <td>
+                      {disabled
+                        ? <span className="muted">disabled</span>
+                        : s.isRunning
+                          ? <span style={{ color: 'var(--accent)' }}>running now</span>
+                          : <span style={{ fontWeight: 500 }}>{humanizeIn(s.nextRunAt)}</span>
+                      }
+                    </td>
+                    <td className="muted small">{s.purpose}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </section>
+      )}
+
       {/* ── Engine cycles table ─────────────────────────────────────────── */}
       <section className="card" style={{ marginBottom: 'var(--space-4)' }}>
         <div className="card-header">
           <h2><Clock size={14} style={{ verticalAlign: -2, marginRight: 6 }} />Recent engine cycles</h2>
-          <span className="muted small">Last 20 runs · every 15 min by default</span>
+          <span className="muted small">Last 20 runs · backstop for missed real-time webhook deals (every 60 min by default)</span>
         </div>
         <table className="table">
           <thead>
@@ -384,7 +617,15 @@ export default function Mt5SyncHealth() {
           </thead>
           <tbody>
             {cycles.map(c => (
-              <tr key={c.id}>
+              <tr
+                key={c.id}
+                onClick={() => openCycle(c.id)}
+                style={{
+                  cursor: 'pointer',
+                  background: cycleDetail?.cycle?.id === c.id ? 'color-mix(in srgb, var(--accent) 8%, transparent)' : undefined,
+                }}
+                title="Click to inspect this cycle's jobs + errors"
+              >
                 <td>
                   <span className="mono small">{new Date(c.started_at).toLocaleString()}</span>
                   <span className="muted small" style={{ marginLeft: 6 }}>
@@ -408,6 +649,120 @@ export default function Mt5SyncHealth() {
             )}
           </tbody>
         </table>
+
+        {/* ── Inline cycle drill-down ──────────────────────────────────── */}
+        {(cycleDetail || cycleDetailLoading || cycleDetailError) && (
+          <div className="pad" style={{
+            borderTop: '1px solid var(--border)',
+            marginTop: 12,
+            paddingTop: 12,
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+              <h3 style={{ margin: 0, fontSize: 14, fontWeight: 600 }}>
+                Cycle drill-down
+              </h3>
+              {cycleDetail?.cycle && (
+                <span className="muted small mono">
+                  {cycleDetail.cycle.id.slice(0, 8)} · started {humanizeAgo(cycleDetail.cycle.started_at)} · {cycleDetail.cycle.status}
+                </span>
+              )}
+              <button
+                type="button"
+                className="btn ghost small"
+                onClick={closeCycle}
+                style={{ marginLeft: 'auto' }}
+              >
+                Close
+              </button>
+            </div>
+
+            {cycleDetailLoading && (
+              <div className="muted small">Loading cycle details…</div>
+            )}
+            {cycleDetailError && (
+              <div style={{ color: 'var(--danger)' }} className="small">
+                Failed to load: {cycleDetailError}
+              </div>
+            )}
+
+            {cycleDetail && !cycleDetailLoading && !cycleDetailError && (
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+                {/* Job-status histogram */}
+                <div>
+                  <div className="muted small" style={{ textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6 }}>
+                    Job status
+                  </div>
+                  {cycleDetail.job_stats.length === 0 ? (
+                    <div className="muted small">No jobs recorded.</div>
+                  ) : (
+                    <table className="table" style={{ fontSize: 12 }}>
+                      <tbody>
+                        {cycleDetail.job_stats.map(s => (
+                          <tr key={s.status}>
+                            <td><StatusDot state={s.status} /> {s.status}</td>
+                            <td className="num mono">{fmt(s.n)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+
+                {/* Error groups (failed + dead jobs) */}
+                <div>
+                  <div className="muted small" style={{ textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6 }}>
+                    Top error reasons
+                  </div>
+                  {cycleDetail.error_groups.length === 0 ? (
+                    <div className="muted small">No errors in this cycle.</div>
+                  ) : (
+                    <table className="table" style={{ fontSize: 12 }}>
+                      <tbody>
+                        {cycleDetail.error_groups.map((g, i) => (
+                          <tr key={i}>
+                            <td style={{ color: 'var(--danger)' }}>{g.reason}</td>
+                            <td className="num mono">{fmt(g.n)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+
+                {/* Sample failures */}
+                {cycleDetail.sample_failures.length > 0 && (
+                  <div style={{ gridColumn: '1 / -1' }}>
+                    <div className="muted small" style={{ textTransform: 'uppercase', letterSpacing: 0.5, marginTop: 8, marginBottom: 6 }}>
+                      Sample failed jobs (last {cycleDetail.sample_failures.length})
+                    </div>
+                    <table className="table" style={{ fontSize: 12 }}>
+                      <thead>
+                        <tr>
+                          <th style={{ width: '12%' }}>Login</th>
+                          <th style={{ width: '20%' }}>Client</th>
+                          <th style={{ width: '8%' }}>Status</th>
+                          <th style={{ width: '8%' }}>Attempt</th>
+                          <th>Last error</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {cycleDetail.sample_failures.map((j, i) => (
+                          <tr key={i}>
+                            <td className="mono small">{j.login}</td>
+                            <td className="small">{j.client_name || j.client_id?.slice(0, 8) || '—'}</td>
+                            <td><StatusDot state={j.status} /> {j.status}</td>
+                            <td className="num mono small">{j.attempt}</td>
+                            <td style={{ color: 'var(--danger)' }} className="small">{j.last_error || '(no error recorded)'}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
       </section>
 
       {/* ── Per-branch deal freshness ───────────────────────────────────── */}

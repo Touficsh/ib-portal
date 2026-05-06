@@ -1,7 +1,8 @@
 import { Fragment, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { ChevronsDown, ChevronsUp, RefreshCw, Download, Filter } from 'lucide-react';
-import { useApi, useMutation } from '../hooks/useApi.js';
+import { useApi, useMutation, useAutoRefresh } from '../hooks/useApi.js';
+import LastUpdated from '../components/LastUpdated.jsx';
 import Button from '../components/ui/Button.jsx';
 import { toast } from '../components/ui/toast.js';
 import { useAuth } from '../auth/AuthContext.jsx';
@@ -231,11 +232,15 @@ export default function Summary() {
   }
 
   // Server-backed fetch. Re-runs whenever the date range or product filter changes.
-  const { data, loading, error, refetch } = useApi(
+  const { data, loading, error, refetch, dataAt } = useApi(
     '/summary',
     { query: { from: fromDate || undefined, to: toDate || undefined, products: productsQuery } },
     [fromDate, toDate, productsQuery]
   );
+  // Auto-refresh every 60s — Summary aggregates a lot of rows so we go a bit
+  // less aggressive than Dashboard/Commissions. Real-time webhook deals will
+  // surface within a minute without a manual reload.
+  useAutoRefresh(refetch, 60_000);
 
   // Refresh MT5 snapshot button
   const [syncMt5, { loading: syncing, error: syncError }] = useMutation();
@@ -363,7 +368,8 @@ export default function Summary() {
             </span>
           </p>
         </div>
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+          <LastUpdated dataAt={dataAt} loading={loading} />
           <Button size="sm" variant="ghost" icon={<ChevronsDown size={14} />} onClick={expandAll}>Expand all</Button>
           <Button size="sm" variant="ghost" icon={<ChevronsUp size={14} />} onClick={collapseAll}>Collapse all</Button>
           {isAdmin && (

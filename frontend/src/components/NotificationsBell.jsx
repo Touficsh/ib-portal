@@ -27,8 +27,19 @@ export default function NotificationsBell() {
 
   useEffect(() => {
     load();
-    const id = setInterval(load, 60_000);
-    return () => clearInterval(id);
+    // Poll every 20 s — commissions write within ~1 s of the trade now,
+    // so a 60 s poll meant the bell was up to a minute behind. 20 s is
+    // a good balance: fresh enough to feel real-time, not so frequent
+    // that it churns the network.
+    const id = setInterval(load, 20_000);
+    // Refresh once on tab refocus so the bell is correct the moment the
+    // user returns from another window.
+    function onVisibility() { if (!document.hidden) load(); }
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      clearInterval(id);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
   }, []);
 
   async function markRead(id) {

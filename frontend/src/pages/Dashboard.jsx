@@ -1,7 +1,8 @@
 import { useMemo, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { TrendingUp, TrendingDown, Users, Target, Sparkles } from 'lucide-react';
-import { useApi } from '../hooks/useApi.js';
+import { useApi, useAutoRefresh } from '../hooks/useApi.js';
+import LastUpdated from '../components/LastUpdated.jsx';
 import { useAuth } from '../auth/AuthContext.jsx';
 import EarningsChart from '../components/ui/EarningsChart.jsx';
 import Sparkline from '../components/ui/Sparkline.jsx';
@@ -13,10 +14,9 @@ import AdminOverview from './admin/AdminOverview.jsx';
  * Agent landing page. Designed to feel like a trading-app home screen:
  *   • Hero card — this-month earnings + Δ vs last month (big numbers)
  *   • 14-day stacked daily earnings bar chart (commission + rebate)
- *   • Pipeline funnel — visual distribution of direct clients by stage
  *   • Sub-agent leaderboard — who in the direct downline is producing
  *   • Top 5 clients (this month) by lots
- *   • YOUR BOOK stats (kept from the old dashboard)
+ *   • YOUR PORTFOLIO stats (kept from the old dashboard)
  *   • FULL SUBTREE stats
  */
 
@@ -91,11 +91,15 @@ export default function Dashboard() {
   // Only agents hit /dashboard — admin-only accounts would get a 403 (endpoint
   // is gated by requireAgentAccess). Passing null to useApi skips the request.
   const isAgentUser = me ? me.is_agent : user?.is_agent;
-  const { data: stats, loading: statsLoading } = useApi(
+  const { data: stats, loading: statsLoading, refetch: refetchStats, dataAt: statsAt } = useApi(
     isAgentUser ? '/dashboard' : null,
     {},
     [isAgentUser]
   );
+  // Real-time commissions write within ~1s of broker execution. Auto-refresh
+  // every 30s so the agent sees new earnings without a manual reload. Paused
+  // while the tab is hidden; refetches once on tab refocus.
+  useAutoRefresh(isAgentUser ? refetchStats : null, 30_000);
 
   // NOTE: all remaining hooks must run on every render (even when we early-
   // return the admin pane below) to preserve hook-call order across renders.
@@ -123,8 +127,6 @@ export default function Dashboard() {
     return <AdminOverview />;
   }
 
-  const funnel = stats?.pipeline_funnel || [];
-  const funnelMax = Math.max(1, ...funnel.map(f => f.count));
 
   const leaders = stats?.sub_agent_leaderboard || [];
   const leaderMax = Math.max(1, ...leaders.map(l => l.monthly_total));
@@ -137,9 +139,51 @@ export default function Dashboard() {
       <header className="page-header">
         <div>
           <h1>{greeting()}, {user?.name?.split(' ')[0] || 'agent'}</h1>
-          <p className="muted">Your earnings, your book, and what's moving below you.</p>
+          <p className="muted">Your earnings, your portfolio, and what's moving below you.</p>
+        </div>
+        <div style={{ paddingTop: 6 }}>
+          <LastUpdated dataAt={statsAt} loading={statsLoading} />
         </div>
       </header>
+
+      {/* Empty-state banner: brand-new agents with no clients/earnings yet
+          get a friendly explanation instead of a wall of zeros. We trip the
+          banner when the agent has no clients AND no commissions ever — i.e.
+          they're set up but the data flywheel hasn't turned yet. */}
+      {!busy && stats && (stats.totals?.clients ?? 0) === 0 && (stats.totals?.lifetime_commission ?? 0) === 0 && (
+        <div
+          style={{
+            background: 'var(--accent-soft, color-mix(in srgb, var(--accent) 8%, transparent))',
+            border: '1px solid color-mix(in srgb, var(--accent) 35%, transparent)',
+            borderRadius: 8,
+            padding: '14px 18px',
+            marginBottom: 'var(--space-4)',
+            display: 'flex',
+            gap: 14,
+            alignItems: 'flex-start',
+          }}
+        >
+          <div style={{
+            width: 32, height: 32, borderRadius: 6,
+            background: 'var(--accent)', color: 'white',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            flexShrink: 0, fontSize: 18,
+          }}>
+            👋
+          </div>
+          <div>
+            <div style={{ fontWeight: 600, marginBottom: 4 }}>
+              Welcome — your account is set up.
+            </div>
+            <div className="muted" style={{ fontSize: 13, lineHeight: 1.5 }}>
+              You don't have any clients or earnings yet. As your referred clients sign up
+              and start trading, their commissions will appear here automatically — usually
+              within a second of each trade. Reach out to your administrator if you expected
+              to see existing clients on this page.
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Hero earnings card — animated counter + trend sparkline */}
       <section className="dash-hero">
@@ -194,42 +238,24 @@ export default function Dashboard() {
         </div>
       </section>
 
-      {/* Funnel + Top clients side by side */}
-      <div className="dash-two-col">
-        <section className="card">
-          <div className="card-header"><h2>Pipeline funnel</h2><span className="muted small">Direct client stages</span></div>
-          <div className="pad">
-            {funnel.map(f => (
-              <div key={f.stage} className="dash-funnel-row">
-                <div className="dash-funnel-label">
-                  <span className={`pill stage-${f.stage.toLowerCase()}`}>{f.stage}</span>
-                </div>
-                <div className="dash-funnel-bar-wrap">
-                  <div className={`dash-funnel-bar stage-${f.stage.toLowerCase()}-bg`} style={{ width: `${(f.count / funnelMax) * 100}%` }} />
-                </div>
-                <div className="dash-funnel-count mono">{f.count}</div>
+      {/* Top clients — full width (Pipeline funnel removed; agents found
+          the funnel noisy and not actionable). */}
+      <section className="card">
+        <div className="card-header"><h2>Top clients (this month)</h2><span className="muted small">By lots traded</span></div>
+        <div className="pad">
+          {topClients.length === 0 && <div className="muted">No trading activity yet this month.</div>}
+          {topClients.map(c => (
+            <div key={c.client_id} className="dash-top-row">
+              <div className="dash-top-name">{c.client_name}</div>
+              <div className="dash-top-bar-wrap">
+                <div className="dash-top-bar" style={{ width: `${(c.lots / topClientsMaxLots) * 100}%` }} />
               </div>
-            ))}
-          </div>
-        </section>
-
-        <section className="card">
-          <div className="card-header"><h2>Top clients (this month)</h2><span className="muted small">By lots traded</span></div>
-          <div className="pad">
-            {topClients.length === 0 && <div className="muted">No trading activity yet this month.</div>}
-            {topClients.map(c => (
-              <div key={c.client_id} className="dash-top-row">
-                <div className="dash-top-name">{c.client_name}</div>
-                <div className="dash-top-bar-wrap">
-                  <div className="dash-top-bar" style={{ width: `${(c.lots / topClientsMaxLots) * 100}%` }} />
-                </div>
-                <div className="dash-top-value mono">{fmt(c.lots)} lots</div>
-                <div className="dash-top-earnings muted small">{fmtMoney(c.earnings)}</div>
-              </div>
-            ))}
-          </div>
-        </section>
-      </div>
+              <div className="dash-top-value mono">{fmt(c.lots)} lots</div>
+              <div className="dash-top-earnings muted small">{fmtMoney(c.earnings)}</div>
+            </div>
+          ))}
+        </div>
+      </section>
 
       {/* Sub-agent leaderboard */}
       {leaders.length > 0 && (
@@ -257,8 +283,8 @@ export default function Dashboard() {
         </section>
       )}
 
-      {/* YOUR BOOK stats — icons + optional trend sparklines */}
-      <div className="stat-row-label">YOUR BOOK</div>
+      {/* YOUR PORTFOLIO stats — icons + optional trend sparklines */}
+      <div className="stat-row-label">YOUR PORTFOLIO</div>
       <section className="stat-row">
         <Stat
           label="Clients"

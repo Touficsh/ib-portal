@@ -315,12 +315,51 @@ export default function AgentDetail() {
     useApi(`/api/agents/${id}/downline`, { query: { type: 'agents', pageSize: 200 } }, [id]);
   const [clientsPage, setClientsPage] = useState(1);
   const [clientsQ, setClientsQ] = useState('');
-  const { data: individuals, loading: individualsLoading } =
+  const { data: individuals, loading: individualsLoading, refetch: refetchIndividuals } =
     useApi(
       `/api/agents/${id}/downline`,
       { query: { type: 'individuals', page: clientsPage, pageSize: 25, q: clientsQ || undefined } },
       [id, clientsPage, clientsQ]
     );
+
+  // Manual add-client modal state
+  const [showAddClient, setShowAddClient] = useState(false);
+  const [newClient, setNewClient] = useState({
+    name: '', email: '', phone: '', country: '', pipeline_stage: 'Lead', mt5_logins: '',
+  });
+  const [createClient, { loading: creatingClient }] = useMutation();
+  function resetNewClient() {
+    setNewClient({ name: '', email: '', phone: '', country: '', pipeline_stage: 'Lead', mt5_logins: '' });
+  }
+  async function submitNewClient(e) {
+    e?.preventDefault?.();
+    const cleanLogins = String(newClient.mt5_logins || '')
+      .split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
+    try {
+      const r = await createClient('/api/admin/clients', {
+        method: 'POST',
+        body: {
+          agent_id: id,
+          name: newClient.name.trim(),
+          email: newClient.email.trim() || undefined,
+          phone: newClient.phone.trim() || undefined,
+          country: newClient.country.trim() || undefined,
+          pipeline_stage: newClient.pipeline_stage,
+          mt5_logins: cleanLogins,
+        },
+      });
+      toast.success(`Client "${r.name}" added${r.mt5_logins_attached > 0 ? ` with ${r.mt5_logins_attached} MT5 login(s)` : ''}`);
+      setShowAddClient(false);
+      resetNewClient();
+      refetchIndividuals();
+    } catch (err) {
+      if (err.status === 409 && err.body?.conflicting_logins) {
+        toast.error(`MT5 login(s) already in use: ${err.body.conflicting_logins.join(', ')}`);
+      } else {
+        toast.error(err.message || 'Failed to add client');
+      }
+    }
+  }
 
   const [setRate, { loading: savingRate }] = useMutation();
   const [healSelf, { loading: healingSelf }] = useMutation();
@@ -654,13 +693,23 @@ export default function AgentDetail() {
       <section className="card">
         <div className="card-header">
           <h2>Individual clients</h2>
-          <span className="muted small">
-            {individualsLoading
-              ? 'loading…'
-              : `page ${individuals?.pagination?.page || 1} of ${
-                  Math.max(1, Math.ceil((individuals?.pagination?.total || 0) / 25))
-                } · ${individuals?.pagination?.total || 0} total`}
-          </span>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <span className="muted small">
+              {individualsLoading
+                ? 'loading…'
+                : `page ${individuals?.pagination?.page || 1} of ${
+                    Math.max(1, Math.ceil((individuals?.pagination?.total || 0) / 25))
+                  } · ${individuals?.pagination?.total || 0} total`}
+            </span>
+            <button
+              type="button"
+              className="btn primary small"
+              onClick={() => setShowAddClient(true)}
+              title="Manually add a client under this agent (for clients not in CRM yet)"
+            >
+              + Add client
+            </button>
+          </div>
         </div>
         <div className="filter-bar" style={{ padding: '10px 16px', margin: 0 }}>
           <input
@@ -713,6 +762,99 @@ export default function AgentDetail() {
           </button>
         </div>
       </section>
+
+      {/* Manual add-client modal — opens from "+ Add client" in the Individual
+          clients section header. Inserts a row with source='manual' so CRM
+          sync skips it. Optional MT5 logins create trading_accounts_meta rows
+          and append to clients.mt5_logins. */}
+      {showAddClient && (
+        <div
+          onClick={(e) => { if (e.target === e.currentTarget) { setShowAddClient(false); resetNewClient(); } }}
+          style={{
+            position: 'fixed', inset: 0, zIndex: 1000,
+            background: 'rgba(0,0,0,0.5)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            padding: 20,
+          }}
+        >
+          <form
+            onSubmit={submitNewClient}
+            className="card"
+            style={{ width: '100%', maxWidth: 520, margin: 0, maxHeight: '90vh', overflow: 'auto' }}
+          >
+            <div className="card-header">
+              <h2 style={{ margin: 0 }}>Add client manually</h2>
+              <button type="button" className="btn ghost small"
+                      onClick={() => { setShowAddClient(false); resetNewClient(); }}>Cancel</button>
+            </div>
+            <div className="pad">
+              <p className="muted small" style={{ marginTop: 0 }}>
+                Use this when a client isn't in xdev CRM yet but you need them tracked in the portal.
+                Recorded as <span className="mono">source = 'manual'</span> — CRM sync will never overwrite them.
+              </p>
+
+              <label className="field">
+                <span>Name *</span>
+                <input className="input" required autoFocus
+                       value={newClient.name}
+                       onChange={e => setNewClient(c => ({ ...c, name: e.target.value }))} />
+              </label>
+
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+                <label className="field">
+                  <span>Email</span>
+                  <input className="input" type="email"
+                         value={newClient.email}
+                         onChange={e => setNewClient(c => ({ ...c, email: e.target.value }))} />
+                </label>
+                <label className="field">
+                  <span>Phone</span>
+                  <input className="input"
+                         value={newClient.phone}
+                         onChange={e => setNewClient(c => ({ ...c, phone: e.target.value }))} />
+                </label>
+                <label className="field">
+                  <span>Country</span>
+                  <input className="input"
+                         value={newClient.country}
+                         onChange={e => setNewClient(c => ({ ...c, country: e.target.value }))} />
+                </label>
+                <label className="field">
+                  <span>Pipeline stage</span>
+                  <select className="input"
+                          value={newClient.pipeline_stage}
+                          onChange={e => setNewClient(c => ({ ...c, pipeline_stage: e.target.value }))}>
+                    <option>Lead</option>
+                    <option>Contacted</option>
+                    <option>Funded</option>
+                    <option>Active</option>
+                  </select>
+                </label>
+              </div>
+
+              <label className="field">
+                <span>MT5 logins (optional, comma or space separated)</span>
+                <input className="input" placeholder="e.g. 67876, 67877, 68000"
+                       value={newClient.mt5_logins}
+                       onChange={e => setNewClient(c => ({ ...c, mt5_logins: e.target.value }))} />
+                <span className="muted small" style={{ marginTop: 4, display: 'block' }}>
+                  Each login creates a row in <span className="mono">trading_accounts_meta</span>.
+                  Logins must be unique (a login already attached to another client is rejected).
+                </span>
+              </label>
+
+              <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 14 }}>
+                <button type="button" className="btn ghost"
+                        onClick={() => { setShowAddClient(false); resetNewClient(); }}>Cancel</button>
+                <button type="submit" className="btn primary"
+                        disabled={creatingClient || !newClient.name.trim()}>
+                  {creatingClient ? 'Adding…' : 'Add client'}
+                </button>
+              </div>
+            </div>
+          </form>
+        </div>
+      )}
     </div>
   );
 }

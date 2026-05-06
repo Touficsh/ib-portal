@@ -1,26 +1,22 @@
 import { useSearchParams } from 'react-router-dom';
-import { Activity, ArrowLeftRight, FileText } from 'lucide-react';
+import { Activity, ArrowLeftRight } from 'lucide-react';
 
 import Mt5SyncHealth from './Mt5SyncHealth.jsx';
 import Reconciliation from './Reconciliation.jsx';
-import DataFlowDocs from './DataFlowDocs.jsx';
 
 /**
  * Admin — System Health (unified)
  *
- * Single page merging three previously-separate admin tools that all answered
- * variations of "is the data pipeline OK and are its outputs correct?":
+ * Single page merging two admin tools that answer "is the data pipeline OK
+ * and are its outputs correct?":
  *
- *   Pipeline       — MT5 bridge gate, engine cycles, deal cache, snapshot settings
- *                    (the old /admin/mt5-sync page).
- *   Reconciliation — engine $ vs MT5 $ drift per agent / per login
- *                    (the old /admin/reconciliation page).
- *   Docs           — plain-English data-flow reference
- *                    (the old /admin/data-flow page).
+ *   Pipeline       — MT5 bridge gate, engine cycles, deal cache, snapshot settings.
+ *   Reconciliation — engine $ vs MT5 $ drift per agent / per login.
  *
- * Each tab is rendered by the same component that used to live on its own
- * page — zero functional change, same URLs (via legacy redirects in App.jsx)
- * still reach the right content.
+ * The old "Docs" tab (DataFlowDocs.jsx) was redundant with the dedicated
+ * /admin/docs page (which renders ARCHITECTURE.md, DATA_FLOW.md, etc. from
+ * disk). Removed from the tab list; ?tab=docs URLs now redirect to /admin/docs
+ * via App.jsx so old bookmarks still work.
  *
  * Tab state is kept in `?tab=...` so bookmarks survive and old URLs can
  * redirect cleanly (e.g. /admin/reconciliation → /admin/system-health?tab=reconciliation).
@@ -29,7 +25,6 @@ import DataFlowDocs from './DataFlowDocs.jsx';
 const TABS = [
   { id: 'pipeline',       label: 'Pipeline',       icon: Activity,       Component: Mt5SyncHealth },
   { id: 'reconciliation', label: 'Reconciliation', icon: ArrowLeftRight, Component: Reconciliation },
-  { id: 'docs',           label: 'Docs',           icon: FileText,       Component: DataFlowDocs },
 ];
 
 export default function SystemHealth() {

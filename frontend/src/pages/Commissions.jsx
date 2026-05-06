@@ -1,7 +1,8 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Download, DollarSign, Gift, TrendingUp, CheckCircle2, Clock, AlertTriangle, HelpCircle } from 'lucide-react';
-import { useApi } from '../hooks/useApi.js';
+import { useApi, useAutoRefresh } from '../hooks/useApi.js';
+import LastUpdated from '../components/LastUpdated.jsx';
 import { getToken } from '../api.js';
 import Button from '../components/ui/Button.jsx';
 import DonutChart from '../components/ui/DonutChart.jsx';
@@ -118,7 +119,7 @@ export default function Commissions() {
     }
   }
 
-  const { data, loading, error } = useApi(
+  const { data, loading, error, refetch: refetchCommissions, dataAt: commissionsAt } = useApi(
     '/commissions',
     {
       query: {
@@ -130,6 +131,9 @@ export default function Commissions() {
     },
     [from, to, page]
   );
+  // Real-time commission writes mean new rows can land any second. Refresh
+  // the visible list every 30s; pauses while the tab is hidden.
+  useAutoRefresh(refetchCommissions, 30_000);
 
   // Readiness status — answers "why am I seeing $0?" without the agent
   // having to ask. Fetched once on page load (not per-filter) since it
@@ -166,9 +170,12 @@ export default function Commissions() {
             Source-agent panel shows which sub-agent's book each dollar flowed through.
           </p>
         </div>
-        <Button variant="secondary" icon={<Download size={14} />} onClick={downloadStatement}>
-          Download statement
-        </Button>
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6 }}>
+          <Button variant="secondary" icon={<Download size={14} />} onClick={downloadStatement}>
+            Download statement
+          </Button>
+          <LastUpdated dataAt={commissionsAt} loading={loading} />
+        </div>
       </header>
 
       <ReadinessBanner status={status} />

@@ -1,6 +1,7 @@
 import { useState } from 'react';
-import { useApi, useMutation } from '../../hooks/useApi.js';
+import { useApi, useMutation, useAutoRefresh } from '../../hooks/useApi.js';
 import { toast, confirm } from '../../components/ui/toast.js';
+import LastUpdated from '../../components/LastUpdated.jsx';
 
 const CRM_SOURCE_BADGE = { crm: 'from x-dev CRM', manual: 'manual' };
 
@@ -10,7 +11,10 @@ const CRM_SOURCE_BADGE = { crm: 'from x-dev CRM', manual: 'manual' };
  * and let the admin retry with ?force=true to clamp.
  */
 export default function AdminProducts() {
-  const { data: products, loading, refetch } = useApi('/api/products', {}, []);
+  const { data: products, loading, refetch, dataAt } = useApi('/api/products', {}, []);
+  // Auto-refresh on tab refocus + every 60s — picks up edits made by another
+  // admin (rate ceilings, product activations) while this view is open.
+  useAutoRefresh(refetch, 60_000);
   const [save, { loading: saving }] = useMutation();
   const [del] = useMutation();
 
@@ -116,7 +120,8 @@ export default function AdminProducts() {
           <h1>Admin · Products</h1>
           <p className="muted">Broker products + per-lot rate ceilings.</p>
         </div>
-        <div style={{ display: 'flex', gap: 10 }}>
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+          <LastUpdated dataAt={dataAt} loading={loading} />
           <button className="btn ghost" onClick={onSyncFromCRM} disabled={syncing} title="Pull /api/products from x-dev's CRM and upsert">
             {syncing ? 'Syncing…' : 'Sync from x-dev CRM'}
           </button>

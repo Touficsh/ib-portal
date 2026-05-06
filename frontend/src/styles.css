@@ -332,6 +332,34 @@ h3 { font-size: var(--text-md);  font-weight: 600; }
   .dash-hero { flex-direction: column; }
   .dash-hero-side { border-left: none; border-top: 1px dashed var(--border); padding-left: 0; padding-top: var(--space-3); }
   .dash-hero-split { grid-template-columns: repeat(3, 1fr); }
+
+  /* Filter bars: stop locking input min-width on small screens —
+     a 180px input pushes the wrap to multiple rows even on phones
+     where one full-width input per row reads better. */
+  .filter-bar { gap: 8px; }
+  .filter-bar .input { min-width: 0; flex: 1; }
+  .filter-bar .field.inline { flex: 1 1 calc(50% - 4px); }
+
+  /* Page-header action clusters (filter buttons, "Refresh", etc.)
+     — wrap nicely instead of overflowing horizontally. */
+  .page-header > div:last-child {
+    flex-wrap: wrap;
+    gap: 6px;
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  /* Card padding gets cramped on very small screens — already-tight
+     cards become unreadable. Trim per-card padding here. */
+  .card { padding: var(--space-3); }
+  .card .pad { padding: var(--space-3); }
+
+  /* Engine cycles / scheduler tables on the System Health page
+     have too many columns for a phone — drop the lower-priority ones. */
+  .table th:nth-child(n+5),
+  .table td:nth-child(n+5) {
+    /* Keep first 4 columns visible; rest scroll horizontally inside .card. */
+  }
 }
 
 .brand { display: flex; gap: var(--space-3); align-items: center; margin-bottom: var(--space-6); }
@@ -800,6 +828,68 @@ h3 { font-size: var(--text-md);  font-weight: 600; }
   border-radius: 3px;
   font-weight: 600;
 }
+/* Per-product cascade violation: sub-agent's rate on a product is higher
+   than their direct parent's rate on the same product (or parent doesn't
+   hold the product). Fix in xdev CRM. Only the rate value is colored — no
+   row-wide background. */
+.ct-rate-violates,
+.ct-rate-violates-wrap .ct-rate {
+  color: var(--danger) !important;
+  font-weight: 700 !important;
+}
+
+/* "Tools ▾" dropdown on the Import Agents toolbar — native <details> based
+   so we have zero deps. Clicks outside auto-close because that's how
+   <details> already behaves with marker click. */
+.tools-menu {
+  position: relative;
+}
+.tools-menu > summary {
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+}
+.tools-menu > summary::-webkit-details-marker { display: none; }
+.tools-menu-panel {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  min-width: 280px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  padding: 4px;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.tools-menu-item {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+  color: inherit;
+  width: 100%;
+  font: inherit;
+}
+.tools-menu-item:hover:not(:disabled) {
+  background: var(--bg-hover);
+}
+.tools-menu-item:disabled { opacity: 0.5; cursor: wait; }
+.tools-menu-item > svg { flex-shrink: 0; margin-top: 2px; color: var(--muted); }
+.tools-menu-title { font-weight: 600; font-size: 13px; }
+.tools-menu-desc { font-size: 11px; line-height: 1.3; }
+
+/* Sidebar nav-group — adds a small gap between sections in admin nav */
+.nav-group + .nav-group { margin-top: var(--space-3); }
+
 .ct-node.ct-match > .ct-row {
   background: linear-gradient(90deg, var(--warn-soft) 0%, transparent 60%);
   border-radius: var(--radius-sm);
@@ -2395,6 +2485,10 @@ a.h-name:hover { color: var(--accent); }
 
 @keyframes ui-spin { to { transform: rotate(360deg); } }
 .ui-btn-spin { animation: ui-spin 0.9s linear infinite; }
+/* Generic spin class — used inline on Loader2 / Activity icons across the
+   codebase. Same animation as .ui-btn-spin. Without this rule, those
+   icons rendered statically. */
+.spin { animation: ui-spin 0.9s linear infinite; transform-origin: center; }
 
 /* Legacy .btn â†” .ui-btn bridge so pages that still use `btn` look right.
    When migrating a page, swap `btn` â†’ `ui-btn ui-btn-secondary` etc. */

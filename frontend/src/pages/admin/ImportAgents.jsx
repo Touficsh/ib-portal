@@ -4,11 +4,13 @@ import {
   UserPlus, Link2, GitBranch, AlertCircle, ChevronDown, ChevronRight, KeyRound, Copy,
   Wand2, Zap, Activity, XCircle, AlertTriangle, RotateCcw, X,
 } from 'lucide-react';
-import { useApi, useMutation } from '../../hooks/useApi.js';
+import { useApi, useMutation, useAutoRefresh } from '../../hooks/useApi.js';
 import Button from '../../components/ui/Button.jsx';
 import Skeleton, { SkeletonRow } from '../../components/ui/Skeleton.jsx';
 import EmptyState from '../../components/ui/EmptyState.jsx';
 import { toast, confirm } from '../../components/ui/toast.js';
+import JobProgressModal from '../../components/JobProgressModal.jsx';
+import LastUpdated from '../../components/LastUpdated.jsx';
 
 /**
  * Admin — Import Agents (by branch)
@@ -29,12 +31,13 @@ import { toast, confirm } from '../../components/ui/toast.js';
 function fmt(n) { return (n ?? 0).toLocaleString(); }
 
 export default function ImportAgents() {
-  const { data: branches, loading: branchesLoading, refetch: refetchBranches } =
+  const { data: branches, loading: branchesLoading, refetch: refetchBranches, dataAt: branchesAt } =
     useApi('/api/agents/importable/branches', {}, []);
 
   const [selectedBranch, setSelectedBranch] = useState(null);
   const [selectedIds, setSelectedIds] = useState(new Set());
   const [showOnlyPending, setShowOnlyPending] = useState(true);
+  const [searchQuery, setSearchQuery] = useState('');
 
   const { data: agents, loading: agentsLoading, refetch: refetchAgents } = useApi(
     selectedBranch
@@ -44,6 +47,13 @@ export default function ImportAgents() {
     [selectedBranch, showOnlyPending]
   );
 
+  // Auto-refresh both data sources on tab refocus + every 90s. The branch list
+  // changes whenever someone imports a new agent (count goes up); the agents
+  // list changes when imports complete in the background. 90s is fine here —
+  // imports are rare events compared to commission/rate edits elsewhere.
+  useAutoRefresh(refetchBranches, 90_000);
+  useAutoRefresh(refetchAgents,   90_000);
+
   const [runImport,  { loading: importing }]   = useMutation();
   const [runSync,    { loading: syncing }]     = useMutation();
   const [runLinks,   { loading: linking }]     = useMutation();
@@ -52,10 +62,14 @@ export default function ImportAgents() {
   const [runFixAll,  { loading: fixingAll }]   = useMutation();
   const [runMt5Sync, { loading: mt5Syncing }]  = useMutation();
   const [runRetry,   { loading: retrying }]    = useMutation();
+  const [runContactSync, { loading: contactSyncing }] = useMutation();
 
   // Latest import result — drives the post-import result card (green/yellow/red).
   // Holds the full response from /api/agents/import including auto_finish payload.
   const [lastImport, setLastImport] = useState(null);
+  // Live progress modal — shown while an import is in flight, polls /api/admin/jobs/:id
+  const [progressJobId, setProgressJobId] = useState(null);
+  const [progressTitle, setProgressTitle] = useState('Working…');
   // Track per-agent retry states: { [agentId]: 'retrying' | 'ok' | 'no_config' | 'failed' }
   const [retryState, setRetryState] = useState({});
 
@@ -91,8 +105,18 @@ export default function ImportAgents() {
       { confirmLabel: `Import ${pending}`, cancelLabel: 'Cancel' }
     );
     if (!ok) return;
+    // Pre-generate a jobId so the progress modal can poll it BEFORE the
+    // request returns. Backend uses the same id (X-Job-Id header) so both
+    // sides reference the same in-memory job state.
+    const jobId = (crypto.randomUUID && crypto.randomUUID()) || `${Date.now()}-${Math.random()}`;
+    setProgressJobId(jobId);
+    setProgressTitle(`Importing "${selectedBranch}" branch (${pending} agents)…`);
     try {
-      const r = await runImport('/api/agents/import', { method: 'POST', body: { branch: selectedBranch } });
+      const r = await runImport('/api/agents/import', {
+        method: 'POST',
+        headers: { 'X-Job-Id': jobId },
+        body: { branch: selectedBranch },
+      });
       setLastImport(r);
       setRetryState({});
       // Keep the password toast for the rare first-import case, but the
@@ -112,14 +136,19 @@ export default function ImportAgents() {
       setSelectedIds(new Set());
     } catch (err) {
       toast.error(err.message || 'Import failed');
+      setProgressJobId(null);  // close modal on error
     }
   }
 
   async function importSelected() {
     if (selectedIds.size === 0) return;
+    const jobId = (crypto.randomUUID && crypto.randomUUID()) || `${Date.now()}-${Math.random()}`;
+    setProgressJobId(jobId);
+    setProgressTitle(`Onboarding ${selectedIds.size} agent${selectedIds.size === 1 ? '' : 's'}…`);
     try {
       const r = await runImport('/api/agents/import', {
         method: 'POST',
+        headers: { 'X-Job-Id': jobId },
         body: { client_ids: Array.from(selectedIds) },
       });
       setLastImport(r);
@@ -134,6 +163,57 @@ export default function ImportAgents() {
       setSelectedIds(new Set());
     } catch (err) {
       toast.error(err.message || 'Import failed');
+      setProgressJobId(null);
+    }
+  }
+
+  // Onboard = import the selected agent(s) + pull their referred contacts +
+  // trading accounts in one shot. Scoped to JUST the newly imported agents
+  // (server uses agentUserIds for the contact sync). Skips the contact-side
+  // CRM call entirely if the import didn't create any new users.
+  async function onboardSelected() {
+    if (selectedIds.size === 0) return;
+    const count = selectedIds.size;
+    const ok = await confirm(
+      `Onboard ${count} agent${count === 1 ? '' : 's'}?\n\n` +
+      `Step 1 — Import agent record(s) (~2 sec each)\n` +
+      `Step 2 — Pull their referred contacts from CRM (~5 min, one-time scan)\n` +
+      `Step 3 — Fetch each new contact's trading accounts (skips fresh ones)\n\n` +
+      `All steps go through the CRM gate. Hit the Pause chip in the sidebar to stop within 10s.`,
+      { confirmLabel: `Onboard ${count}`, cancelLabel: 'Cancel' }
+    );
+    if (!ok) return;
+    const jobId = (crypto.randomUUID && crypto.randomUUID()) || `${Date.now()}-${Math.random()}`;
+    setProgressJobId(jobId);
+    setProgressTitle(`Onboarding ${count} agent${count === 1 ? '' : 's'} (with contacts)…`);
+    try {
+      const r = await runImport('/api/agents/import?withContacts=1', {
+        method: 'POST',
+        headers: { 'X-Job-Id': jobId },
+        body: { client_ids: Array.from(selectedIds) },
+      });
+      setLastImport(r);
+      setRetryState({});
+      const cs = r.contact_sync;
+      const csLine = cs
+        ? cs.aborted
+          ? ` · contact sync aborted: ${cs.abortReason}`
+          : ` · pulled ${cs.contactsInserted ?? 0} new clients, ${cs.loginsFound ?? 0} MT5 logins`
+        : '';
+      if (r.created > 0) {
+        toast.success(
+          `Onboarded ${r.created} agent${r.created === 1 ? '' : 's'}${csLine} · default password: ${r.default_password || 'Portal@2026'}`,
+          { duration: 15000 }
+        );
+      } else {
+        toast.info(`No new agents — those were already imported${csLine}`);
+      }
+      refetchBranches();
+      refetchAgents();
+      setSelectedIds(new Set());
+    } catch (err) {
+      toast.error(err.message || 'Onboard failed');
+      setProgressJobId(null);
     }
   }
 
@@ -182,6 +262,65 @@ export default function ImportAgents() {
     }
   }
 
+  // Pull individual contacts (and their MT5 trading accounts) from CRM.
+  // Scope: if a branch is selected on the left, narrows to agents in that
+  // branch; otherwise covers every imported agent across all branches.
+  // Phase 2 (trading-accounts fetch) skips contacts synced within last 24h
+  // so re-runs are cheap — only stale rows incur a CRM call.
+  async function syncContactsFromCRM() {
+    const scope = selectedBranch
+      ? `agents in "${selectedBranch}" branch only`
+      : `EVERY imported agent across all branches`;
+    const ok = await confirm(
+      `Pull individual contacts + their trading accounts from CRM for ${scope}?\n\n` +
+      `What it does:\n` +
+      `  · Pages through CRM /api/contacts (~272 pages, one full sweep)\n` +
+      `  · Keeps only contacts whose connectedAgent matches your scoped imported agents\n` +
+      `  · Inserts/updates them as clients (contact_type='individual')\n` +
+      `  · Fetches trading accounts for any contact whose data is older than 24h\n\n` +
+      `Cost: ~272 contacts-list calls + N trading-account calls (skips fresh ones).\n` +
+      `Time: ~5 minutes.\n` +
+      `Stop anytime: hit the CRM Pause chip in the sidebar — everything halts within ~10 seconds.`,
+      { confirmLabel: selectedBranch ? `Sync "${selectedBranch}" contacts` : 'Sync all contacts', cancelLabel: 'Cancel' }
+    );
+    if (!ok) return;
+    const jobId = (crypto.randomUUID && crypto.randomUUID()) || `${Date.now()}-${Math.random()}`;
+    setProgressJobId(jobId);
+    setProgressTitle(selectedBranch ? `Syncing "${selectedBranch}" contacts…` : 'Syncing all contacts…');
+    try {
+      const r = await runContactSync('/api/sync/contacts/by-agent', {
+        method: 'POST',
+        headers: { 'X-Job-Id': jobId },
+        body: {
+          branchName: selectedBranch || null,
+          maxPages: 300,
+          maxTaCalls: 500,
+          resume: true,
+          taFreshnessHours: 24,
+        },
+      });
+      if (r.aborted) {
+        toast.error(
+          `Contact sync aborted: ${r.abortReason}\n` +
+          `Pages scanned: ${r.pagesScanned}, contacts inserted so far: ${r.contactsInserted}`,
+          { duration: 12000 }
+        );
+      } else {
+        toast.success(
+          `Contact sync done — scope: ${r.scope} (${r.agentCount} agents).\n` +
+          `Inserted: ${r.contactsInserted}, updated: ${r.contactsUpdated}\n` +
+          `Trading accounts: ${r.tradingAccountsFetched} fetched, ${r.tradingAccountsSkippedFresh || 0} skipped (still fresh), ${r.loginsFound} MT5 logins found\n` +
+          `${r.finalPage ? '✓ Full sweep complete' : `Stopped at page ${r.endPage} — re-run to continue from checkpoint`}`,
+          { duration: 15000 }
+        );
+      }
+      refetchBranches();
+      if (selectedBranch) refetchAgents();
+    } catch (err) {
+      toast.error(err.message || 'Contact sync failed');
+    }
+  }
+
   async function fixAllImported() {
     const ok = await confirm(
       `Run the full healing pipeline across EVERY imported agent?\n\n` +
@@ -192,8 +331,11 @@ export default function ImportAgents() {
       { confirmLabel: 'Fix all imported', cancelLabel: 'Cancel', variant: 'warning' }
     );
     if (!ok) return;
+    const jobId = (crypto.randomUUID && crypto.randomUUID()) || `${Date.now()}-${Math.random()}`;
+    setProgressJobId(jobId);
+    setProgressTitle('Fix all imported — products + rates + rebuild commissions');
     try {
-      const r = await runFixAll('/api/agents/fix-all-imported', { method: 'POST' });
+      const r = await runFixAll('/api/agents/fix-all-imported', { method: 'POST', headers: { 'X-Job-Id': jobId } });
       const rates = r.steps?.find(s => s.step === 'heal_rates');
       const prods = r.steps?.find(s => s.step === 'sync_agent_products');
       toast.success(
@@ -240,13 +382,17 @@ export default function ImportAgents() {
       backfill: { label: 'Backfill parent links from CRM',   mutator: runBackfill, url: '/api/agents/backfill-parents' },
     };
     const a = actions[kind];
+    const jobId = (crypto.randomUUID && crypto.randomUUID()) || `${Date.now()}-${Math.random()}`;
+    setProgressJobId(jobId);
+    setProgressTitle(a.label);
     try {
-      const r = await a.mutator(a.url, { method: 'POST' });
+      const r = await a.mutator(a.url, { method: 'POST', headers: { 'X-Job-Id': jobId } });
       toast.success(`${a.label} — done.${r.created ? ` created ${r.created}` : ''}${r.updated ? ` · updated ${r.updated}` : ''}`);
       refetchBranches();
       if (selectedBranch) refetchAgents();
     } catch (err) {
       toast.error(err.message || `${a.label} failed`);
+      setProgressJobId(null);
     }
   }
 
@@ -255,7 +401,18 @@ export default function ImportAgents() {
   const totalPending  = (branches || []).reduce((s, b) => s + b.pending, 0);
 
   const selectedBranchSummary = branches?.find(b => b.branch === selectedBranch);
-  const visibleAgents = agents || [];
+
+  // Apply client-side search filter on top of the server-side onlyPending filter.
+  // Search matches name OR email (case-insensitive). Empty query → no filtering.
+  const allAgents = agents || [];
+  const q = searchQuery.trim().toLowerCase();
+  const visibleAgents = q.length === 0
+    ? allAgents
+    : allAgents.filter(a =>
+        (a.name || '').toLowerCase().includes(q) ||
+        (a.email || '').toLowerCase().includes(q) ||
+        (a.id || '').toLowerCase().includes(q)
+      );
   const pendingInView = visibleAgents.filter(a => !a.user_id).length;
   const selectedPendingInView = visibleAgents
     .filter(a => !a.user_id && selectedIds.has(a.id))
@@ -272,27 +429,68 @@ export default function ImportAgents() {
             agents, then import the whole branch or just the ones you pick.
           </p>
         </div>
-        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-          <Button size="sm" variant="primary" icon={<Zap size={14} />} loading={fixingAll}
-                  onClick={fixAllImported}
-                  title="One-click heal for every imported agent: sync product links → heal rates → rebuild commissions. Use this if commission history is empty for any branch.">
-            Fix all imported
-          </Button>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+          <LastUpdated dataAt={branchesAt} loading={branchesLoading} />
+          {/* Primary daily action — pulls newly added CRM agents into the
+              importable pool. Stays at top level because every fresh admin
+              clicks this first to populate the page. */}
           <Button size="sm" variant="ghost" icon={<RefreshCw size={14} />} loading={syncing}
                   onClick={() => runPostImport('sync')}
-                  title="Pull the latest agent list from x-dev CRM into the local mirror">
+                  title="Pull the latest agent list from x-dev CRM into the local mirror. Run this if you can't find a newly added CRM agent in the list below.">
             Refresh from CRM
           </Button>
-          <Button size="sm" variant="ghost" icon={<Link2 size={14} />} loading={linking}
-                  onClick={() => runPostImport('links')}
-                  title="Re-read product.agents[] from every CRM product and create agent_products rows">
-            Sync product links
-          </Button>
-          <Button size="sm" variant="ghost" icon={<GitBranch size={14} />} loading={backfilling}
-                  onClick={() => runPostImport('backfill')}
-                  title="Scan all agents for connectedAgent in CRM and fill missing parent links (takes 3–8 min)">
-            Backfill parents
-          </Button>
+
+          {/* Maintenance / recovery actions — collapsed into a dropdown so
+              they don't clutter the daily flow. Native <details> for zero deps. */}
+          <details className="tools-menu">
+            <summary className="btn ghost small" title="Recovery & bulk maintenance actions">
+              Tools ▾
+            </summary>
+            <div className="tools-menu-panel">
+              <button type="button" className="tools-menu-item"
+                      disabled={contactSyncing}
+                      onClick={(e) => { e.target.closest('details').open = false; syncContactsFromCRM(); }}
+                      title={selectedBranch
+                        ? `Pull contacts + trading accounts for agents in "${selectedBranch}" only.`
+                        : 'Pull contacts + trading accounts for ALL imported agents.'}>
+                <Users size={14} />
+                <div>
+                  <div className="tools-menu-title">{selectedBranch ? `Sync "${selectedBranch}" contacts` : 'Sync all contacts'}</div>
+                  <div className="tools-menu-desc muted small">{contactSyncing ? 'Running…' : 'Pull contacts + trading accounts. Skips fresh.'}</div>
+                </div>
+              </button>
+              <button type="button" className="tools-menu-item"
+                      disabled={fixingAll}
+                      onClick={(e) => { e.target.closest('details').open = false; fixAllImported(); }}
+                      title="Heal commission rates and rebuild all commission history. Use if amounts look wrong.">
+                <Zap size={14} />
+                <div>
+                  <div className="tools-menu-title">Fix all imported</div>
+                  <div className="tools-menu-desc muted small">{fixingAll ? 'Running…' : 'Heal rates + rebuild commissions.'}</div>
+                </div>
+              </button>
+              <button type="button" className="tools-menu-item"
+                      disabled={linking}
+                      onClick={(e) => { e.target.closest('details').open = false; runPostImport('links'); }}
+                      title="Re-read CRM product.agents[] and refresh agent_products links">
+                <Link2 size={14} />
+                <div>
+                  <div className="tools-menu-title">Sync product links</div>
+                  <div className="tools-menu-desc muted small">{linking ? 'Running…' : 'Refresh which agents hold which products.'}</div>
+                </div>
+              </button>
+              <button type="button" className="tools-menu-item"
+                      disabled={backfilling}
+                      onClick={(e) => { e.target.closest('details').open = false; runPostImport('backfill'); }}
+                      title="Scan agents and fill missing parent links from CRM (takes 3–8 min)">
+                <GitBranch size={14} />
+                <div>
+                  <div className="tools-menu-title">Backfill parents</div>
+                  <div className="tools-menu-desc muted small">{backfilling ? 'Running…' : 'Fix missing parent_agent_id links.'}</div>
+                </div>
+              </button>
+            </div>
+          </details>
         </div>
       </header>
 
@@ -455,24 +653,66 @@ export default function ImportAgents() {
                     </>
                   )}
                   {selectedIds.size > 0 && (
-                    <Button size="sm" variant="secondary" icon={<UserPlus size={14} />} loading={importing}
-                            onClick={importSelected}>
-                      Import {selectedIds.size} selected
+                    <>
+                      <Button size="sm" variant="primary" icon={<Zap size={14} />} loading={importing}
+                              onClick={onboardSelected}
+                              title="Import the selected agents AND pull their referred contacts + MT5 trading accounts in one shot. ~5 min total. Stoppable via the CRM Pause chip.">
+                        Onboard {selectedIds.size} selected
+                      </Button>
+                      <Button size="sm" variant="ghost" icon={<UserPlus size={14} />} loading={importing}
+                              onClick={importSelected}
+                              title="Import only the agent record (fast, no contacts). Use Onboard if you want their clients too.">
+                        Import only
+                      </Button>
+                    </>
+                  )}
+                  {selectedIds.size === 0 && (
+                    <Button size="sm" variant="ghost" icon={<ArrowRight size={14} />} loading={importing}
+                            disabled={(selectedBranchSummary?.pending || 0) === 0}
+                            onClick={importBranch}
+                            title="Import all pending agents in this branch (no contact sync). For bulk branch onboarding use the Tools menu.">
+                      Import all pending ({selectedBranchSummary?.pending || 0})
                     </Button>
                   )}
-                  <Button size="sm" variant="primary" icon={<ArrowRight size={14} />} loading={importing}
-                          disabled={(selectedBranchSummary?.pending || 0) === 0}
-                          onClick={importBranch}>
-                    Import all pending ({selectedBranchSummary?.pending || 0})
-                  </Button>
                 </div>
               </div>
 
-              <div className="pad" style={{ paddingBottom: 0, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 13, cursor: 'pointer' }}>
-                  <input type="checkbox" checked={showOnlyPending} onChange={e => setShowOnlyPending(e.target.checked)} />
-                  <span>Only show pending</span>
-                </label>
+              <div className="pad" style={{ paddingBottom: 'var(--space-3)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+                <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap', flex: 1 }}>
+                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 13, cursor: 'pointer' }}>
+                    <input type="checkbox" checked={showOnlyPending} onChange={e => setShowOnlyPending(e.target.checked)} />
+                    <span>Only show pending</span>
+                  </label>
+                  <div style={{ position: 'relative', flex: 1, maxWidth: 320 }}>
+                    <input
+                      type="search"
+                      value={searchQuery}
+                      onChange={e => setSearchQuery(e.target.value)}
+                      placeholder="Search by name, email, or ID…"
+                      className="input"
+                      style={{ width: '100%', padding: '6px 28px 6px 10px', fontSize: 13 }}
+                    />
+                    {searchQuery && (
+                      <button
+                        type="button"
+                        onClick={() => setSearchQuery('')}
+                        title="Clear search"
+                        style={{
+                          position: 'absolute', right: 6, top: '50%', transform: 'translateY(-50%)',
+                          background: 'transparent', border: 'none', cursor: 'pointer',
+                          color: 'var(--muted)', padding: 2, display: 'flex', alignItems: 'center',
+                        }}
+                      >
+                        <X size={14} />
+                      </button>
+                    )}
+                  </div>
+                  {q.length > 0 && (
+                    <span className="muted small">
+                      {visibleAgents.length} of {allAgents.length} match
+                    </span>
+                  )}
+                </div>
                 <button type="button" className="btn ghost small" onClick={toggleAllVisible} disabled={pendingInView === 0}>
                   {allVisibleSelected ? 'Clear selection' : `Select all ${pendingInView} pending`}
                 </button>
@@ -575,6 +815,16 @@ export default function ImportAgents() {
           )}
         </main>
       </div>
+
+      {/* Live progress modal — opens during long imports/onboards. Polls
+          /api/admin/jobs/:id every second and auto-closes 1.5s after success. */}
+      {progressJobId && (
+        <JobProgressModal
+          jobId={progressJobId}
+          title={progressTitle}
+          onClose={() => setProgressJobId(null)}
+        />
+      )}
     </div>
   );
 }

@@ -7,6 +7,7 @@ import {
 import { useApi, useMutation } from '../../hooks/useApi.js';
 import { toast } from '../../components/ui/toast.js';
 import CommissionsSection from '../../components/CommissionsSection.jsx';
+import JobProgressModal from '../../components/JobProgressModal.jsx';
 import {
   fmt, NumCells, SubAgentRow, ClientRow, AccountRow,
 } from '../Summary.jsx';
@@ -123,23 +124,37 @@ function Mt5FreshnessCard({ userId }) {
   const cachedDealCount       = data.cached_deal_count       || 0;
   const staleLogins           = data.stale_logins            || [];
 
-  // Health classification, warmest → coldest
+  // Health classification — three distinct cases:
+  //   1. Unfetched logins exist (bridge hasn't been called) → really partial
+  //   2. All fetched, some have deals, others are dormant → that's normal,
+  //      a "dormant" account is a real MT5 account whose owner never traded
+  //      (no deposit, no orders). Bridge correctly returns 0 deals — not a bug.
+  //   3. All fetched, all have deals → green
+  //   4. All fetched, none have deals → unusual but legit (entirely dormant subtree)
+  const dormantCount = subtreeLogins - loginsWithDeals - loginsNeverSynced;
   let state, stateLabel, stateColor;
   if (subtreeLogins === 0) {
     state = 'empty';
     stateLabel = 'No MT5 logins in subtree';
     stateColor = 'var(--text-muted)';
-  } else if (loginsWithDeals === 0) {
-    state = 'not-fetched';
-    stateLabel = 'No deals fetched yet';
-    stateColor = 'var(--danger)';
-  } else if (loginsWithDeals < subtreeLogins * 0.5) {
+  } else if (loginsNeverSynced > 0) {
+    // Real "partial": there are logins we haven't asked the bridge about yet
     state = 'partial';
-    stateLabel = `Partial — ${loginsWithDeals}/${subtreeLogins} logins have cached deals`;
+    stateLabel = `${loginsNeverSynced} login${loginsNeverSynced === 1 ? '' : 's'} not yet fetched — click Refresh MT5`;
     stateColor = 'var(--warn)';
+  } else if (loginsWithDeals === 0) {
+    // Fully synced but nobody traded — unusual
+    state = 'all-dormant';
+    stateLabel = `All ${subtreeLogins} logins fetched · none have traded yet`;
+    stateColor = 'var(--text-muted)';
+  } else if (dormantCount > 0) {
+    // Healthy partial — fetched everyone, some haven't traded yet
+    state = 'good';
+    stateLabel = `All ${subtreeLogins} logins fetched · ${dormantCount} client${dormantCount === 1 ? '' : 's'} with no deals cached`;
+    stateColor = 'var(--success)';
   } else {
     state = 'good';
-    stateLabel = `Good — ${loginsWithDeals}/${subtreeLogins} logins have cached deals`;
+    stateLabel = `All ${subtreeLogins} logins fetched and trading`;
     stateColor = 'var(--success)';
   }
 
@@ -674,6 +689,57 @@ export default function AgentSummary() {
   }
   function clearDateRange() { setDateRange('', ''); }
 
+  // Quick-pick preset ranges. All boundaries are inclusive YYYY-MM-DD strings
+  // in the user's local timezone — same shape the existing date inputs use.
+  const datePresets = useMemo(() => {
+    const ymd = (d) => {
+      const y = d.getFullYear();
+      const m = String(d.getMonth() + 1).padStart(2, '0');
+      const day = String(d.getDate()).padStart(2, '0');
+      return `${y}-${m}-${day}`;
+    };
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const todayStr = ymd(today);
+
+    // Week starts Monday (ISO). Adjust if your business prefers Sunday.
+    const dow = today.getDay();              // 0=Sun, 1=Mon, ..., 6=Sat
+    const daysFromMon = (dow + 6) % 7;       // Mon=0, Sun=6
+    const weekStart = new Date(today);
+    weekStart.setDate(today.getDate() - daysFromMon);
+    const lastWeekStart = new Date(weekStart);
+    lastWeekStart.setDate(weekStart.getDate() - 7);
+    const lastWeekEnd = new Date(weekStart);
+    lastWeekEnd.setDate(weekStart.getDate() - 1);
+
+    const monthStart = new Date(today.getFullYear(), today.getMonth(), 1);
+    const lastMonthStart = new Date(today.getFullYear(), today.getMonth() - 1, 1);
+    const lastMonthEnd = new Date(today.getFullYear(), today.getMonth(), 0);
+
+    const yearStart = new Date(today.getFullYear(), 0, 1);
+
+    const last7 = new Date(today); last7.setDate(today.getDate() - 6);
+    const last30 = new Date(today); last30.setDate(today.getDate() - 29);
+    const last90 = new Date(today); last90.setDate(today.getDate() - 89);
+
+    return [
+      { key: 'today',     label: 'Today',         from: todayStr,           to: todayStr },
+      { key: 'last7',     label: 'Last 7 days',   from: ymd(last7),         to: todayStr },
+      { key: 'this_week', label: 'This week',     from: ymd(weekStart),     to: todayStr },
+      { key: 'last_week', label: 'Last week',     from: ymd(lastWeekStart), to: ymd(lastWeekEnd) },
+      { key: 'last30',    label: 'Last 30 days',  from: ymd(last30),        to: todayStr },
+      { key: 'this_month',label: 'This month',    from: ymd(monthStart),    to: todayStr },
+      { key: 'last_month',label: 'Last month',    from: ymd(lastMonthStart),to: ymd(lastMonthEnd) },
+      { key: 'last90',    label: 'Last 90 days',  from: ymd(last90),        to: todayStr },
+      { key: 'ytd',       label: 'Year to date',  from: ymd(yearStart),     to: todayStr },
+    ];
+  }, []);
+  // Detect which preset (if any) matches the current range so we can highlight it.
+  const activePreset = useMemo(() => {
+    if (!fromYmd && !toYmd) return null;
+    return datePresets.find(p => p.from === fromYmd && p.to === toYmd)?.key || null;
+  }, [fromYmd, toYmd, datePresets]);
+
   // Summary tab payload — only fetch when the Summary tab is active and an
   // agent is selected. Tab switching between Summary and Commissions won't
   // re-fetch Summary data needlessly; React Query-style caching could
@@ -692,12 +758,19 @@ export default function AgentSummary() {
   } = useApi(summaryUrl, {}, [selectedAgentId, tab, fromYmd, toYmd]);
 
   const [syncMt5, { loading: syncing }] = useMutation();
+  // Live progress modal — opens during Refresh MT5
+  const [progressJobId, setProgressJobId] = useState(null);
+  const [progressTitle, setProgressTitle] = useState('Working…');
+
   async function handleSync() {
     if (!selectedAgentId) return;
+    const jobId = (crypto.randomUUID && crypto.randomUUID()) || `${Date.now()}-${Math.random()}`;
+    setProgressJobId(jobId);
+    setProgressTitle('Refreshing MT5 snapshots');
     // Full /api/... path — api.js only treats paths starting with /api as
     // absolute; anything else gets prefixed with /api/portal, which would
     // 404 here silently.
-    const promise = syncMt5(`/api/admin/agent-summary/${selectedAgentId}/sync-mt5`, { method: 'POST' })
+    const promise = syncMt5(`/api/admin/agent-summary/${selectedAgentId}/sync-mt5`, { method: 'POST', headers: { 'X-Job-Id': jobId } })
       .then(async r => { await refetch(); return r; });
     toast.promise(promise, {
       loading: 'Refreshing MT5 snapshot…',
@@ -975,7 +1048,7 @@ export default function AgentSummary() {
           {/* Date-range filter — affects deal-level aggregates (lots,
               commission, deposits, withdrawals). Balance and equity stay
               point-in-time. Empty fields = all time. */}
-          <div className="filter-bar">
+          <div className="filter-bar" style={{ flexWrap: 'wrap', gap: 8 }}>
             <label className="field inline">
               <span>From</span>
               <input
@@ -1008,6 +1081,28 @@ export default function AgentSummary() {
             </span>
           </div>
 
+          {/* Quick-pick presets. Click to set both dates instantly. The
+              currently-active preset (if the date range matches one) is
+              highlighted. */}
+          <div className="filter-bar" style={{ gap: 6, flexWrap: 'wrap', marginTop: 4 }}>
+            <span className="muted small" style={{ marginRight: 4 }}>Quick range:</span>
+            {datePresets.map(p => {
+              const isActive = activePreset === p.key;
+              return (
+                <button
+                  key={p.key}
+                  type="button"
+                  className={`btn small ${isActive ? '' : 'ghost'}`}
+                  onClick={() => setDateRange(p.from, p.to)}
+                  title={`${p.from} → ${p.to}`}
+                  style={isActive ? { background: 'var(--accent)', color: '#fff', borderColor: 'var(--accent)' } : undefined}
+                >
+                  {p.label}
+                </button>
+              );
+            })}
+          </div>
+
           <div className="filter-bar">
             <div className="muted small">
               MT5 snapshot: {relativeTime(summary.mt5_synced_at)}
@@ -1025,7 +1120,7 @@ export default function AgentSummary() {
                 <thead>
                   <tr>
                     <th>Name</th>
-                    <th>Kind</th>
+                    <th>Type</th>
                     <th className="num">Lots</th>
                     <th className="num">Commission</th>
                     <th className="num">Deposit</th>
@@ -1050,6 +1145,14 @@ export default function AgentSummary() {
           <RecomputePanel agentId={selectedAgentId} agentName={selectedAgent?.name || ''} />
           <CommissionsSection agentId={selectedAgentId} />
         </>
+      )}
+
+      {progressJobId && (
+        <JobProgressModal
+          jobId={progressJobId}
+          title={progressTitle}
+          onClose={() => setProgressJobId(null)}
+        />
       )}
     </div>
   );
