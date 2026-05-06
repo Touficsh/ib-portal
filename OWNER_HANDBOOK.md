@@ -304,7 +304,7 @@ Don't try these yourself unless you're comfortable with computers and the
 developer is unreachable:
 
 - Editing any files inside `C:\ib-portal\backend\` or
-  `C:\live-crm-sales\mt5-bridge\`
+  `C:\ib-portal\mt5-bridge\`
 - The Settings page → "MT5 Server TZ Offset" or "MT5 Server" fields
 - The Settings page → "CRM Base URL" or "CRM API Key" fields
 - Anything labeled "advanced" or "DB-only"

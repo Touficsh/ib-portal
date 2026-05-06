@@ -1,0 +1,20 @@
+# .NET build output
+bin/
+obj/
+
+# Runtime logs
+bridge-run.log
+bridge-err.log
+*.log
+
+# Environment overrides
+.env
+.env.local
+
+# Visual Studio / Rider scratch
+.vs/
+.vscode/
+
+# Local SDK reference (we point at C:\MetaTrader5SDK\Libs\... in the .csproj)
+# but if anyone vendors a copy here, don't commit it
+Libs/

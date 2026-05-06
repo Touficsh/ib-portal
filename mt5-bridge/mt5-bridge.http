@@ -1,0 +1,6 @@
+@mt5_bridge_HostAddress = http://localhost:5139
+
+GET {{mt5_bridge_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

@@ -486,7 +486,7 @@ This works for admins, agents, and demoted reps. Idempotent.
 
 1. Bring bridge back online — **always use the launcher**:
    ```powershell
-   pwsh C:\live-crm-sales\mt5-bridge\start-bridge.ps1
+   pwsh C:\ib-portal\mt5-bridge\start-bridge.ps1
    ```
    Do NOT double-click `mt5-bridge.exe` — without env vars set, every webhook POST will 401 and you'll lose the real-time stream.
 2. **System Health → Pipeline → Resume bridge** (if the gate was paused)
@@ -519,7 +519,7 @@ The 60-day window is governed by `settings.mt5_initial_lookback_days` (admin →
 Diagnose top-down:
 
 1. **Bridge alive?** → admin Settings page → "MT5 Manager API" section → click "Check bridge status". Should show MT5 connected (green).
-2. **Bridge auth OK?** If "Check bridge status" says not connected, click "Save & reconnect". Watch `C:\live-crm-sales\mt5-bridge\bridge-run.log` for the connection result.
+2. **Bridge auth OK?** If "Check bridge status" says not connected, click "Save & reconnect". Watch `C:\ib-portal\mt5-bridge\bridge-run.log` for the connection result.
 3. **Webhook secret matches?** → "Real-time deal stream" card → "Last error" field. If it says "invalid webhook secret", the bridge process was started without `MT5_WEBHOOK_SECRET` env var. Restart with the launcher script (see above).
 4. **Broker market hours?** Outside trading hours, deal flow is naturally 0. Check during a known-active session.
 5. **Source IP whitelist?** If `mt5Connected: true` but `[DealSink] Subscribed: MT5_RET_ERR_NETWORK` appears in the bridge log, ask the broker to whitelist this server's outbound IP at the manager-API endpoint.

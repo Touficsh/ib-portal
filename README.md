@@ -28,6 +28,11 @@ C:\ib-portal\
 │   ├── package.json
 │   └── .env.example
 ├── frontend\         Vite/React agent portal SPA
+├── mt5-bridge\       .NET 8 service: MT5 Manager API → portal webhook
+│   ├── Program.cs              DealSubscribe + reconnect loop + HTTP endpoints
+│   ├── mt5-bridge.csproj       References MetaQuotes SDK at C:\MetaTrader5SDK\
+│   ├── start-bridge.ps1        Launcher (reads MT5_WEBHOOK_SECRET from backend/.env)
+│   └── README.md               Bridge-specific build + run instructions
 ├── sync\
 │   └── migrate-agents.js   One-time agent data migration from CRM DB
 ├── .gitignore
@@ -191,7 +196,7 @@ This replaces the old `GET /api/contacts/:id/trading-accounts` calls into the CR
 
 **Track deal flow**: admin → MT5 Sync Health page → "Real-time deal stream" card shows webhook deals received in the last 1/5/15/60 minutes, plus total counters since process restart.
 
-**Bridge launcher**: use `C:\live-crm-sales\mt5-bridge\start-bridge.ps1` (sets `MT5_WEBHOOK_SECRET` and `CRM_BACKEND_URL` env vars, kills any running bridge, starts a fresh one, verifies `/health`). Do NOT launch `mt5-bridge.exe` directly — it will start with an empty webhook secret and every webhook POST will 401.
+**Bridge launcher**: use `C:\ib-portal\mt5-bridge\start-bridge.ps1` (reads `MT5_WEBHOOK_SECRET` from `backend/.env`, sets `CRM_BACKEND_URL`, kills any running bridge, starts a fresh one, verifies `/health`). Do NOT launch `mt5-bridge.exe` directly — it'll start with an empty webhook secret and every webhook POST will 401. The bridge source + build config live under `mt5-bridge/`; see [`mt5-bridge/README.md`](mt5-bridge/README.md) for build prerequisites.
 
 ---
 
