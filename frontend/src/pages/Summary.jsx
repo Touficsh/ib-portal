@@ -101,15 +101,34 @@ export function ClientRow({ c, depth, expanded, onToggle }) {
   const pillClass = c.variant === 'lead' ? 'stage-lead' : 'stage-funded';
   const avatarClass = c.variant === 'lead' ? 'sum-avatar-lead' : 'sum-avatar-client';
   const label = c.variant === 'lead' ? 'Lead' : 'Client';
+  // When the row is from a sub-agent who hasn't granted name-sharing,
+  // c.name comes back null and c.name_redacted=true. Show the first
+  // login number as a stable identifier and an explainer tooltip.
+  const isRedacted  = c.name_redacted === true;
+  const firstLogin  = c.accounts?.[0]?.login || null;
+  const displayName = isRedacted
+    ? (firstLogin ? `MT5 #${firstLogin}` : 'Hidden client')
+    : (c.name || '—');
+  const subText = isRedacted
+    ? `Name hidden — sub-agent hasn't granted name-sharing${c.accounts?.length > 1 ? ` · ${c.accounts.length} accounts` : ''}`
+    : `${c.email || '—'}${c.stage ? ` · ${c.stage}` : ''}`;
   return (
-    <tr className="sum-row sum-row-client" onClick={onToggle}>
+    <tr
+      className={`sum-row sum-row-client ${isRedacted ? 'sum-row-redacted' : ''}`}
+      onClick={onToggle}
+      title={isRedacted ? "This client's name is hidden by their sub-agent's privacy setting." : undefined}
+    >
       <td>
         <div className="sum-name" style={{ paddingLeft: depth * 28 }}>
           <ExpandBtn expanded={expanded} onClick={onToggle} disabled={!c.accounts?.length} />
-          <div className={`sum-avatar ${avatarClass}`}>{(c.name || '?')[0].toUpperCase()}</div>
+          <div className={`sum-avatar ${avatarClass}`}>
+            {isRedacted ? '🔒' : (c.name || '?')[0].toUpperCase()}
+          </div>
           <div className="sum-lines">
-            <div className="sum-name-main">{c.name}</div>
-            <div className="muted small">{c.email || '—'}{c.stage ? ` · ${c.stage}` : ''}</div>
+            <div className="sum-name-main" style={isRedacted ? { fontStyle: 'italic' } : undefined}>
+              {displayName}
+            </div>
+            <div className="muted small">{subText}</div>
           </div>
         </div>
       </td>

@@ -73,7 +73,9 @@ router.get('/:userId', cacheMw({ ttl: 60 }), async (req, res, next) => {
       ? String(req.query.products).split(',').map(s => s.trim()).filter(Boolean)
       : [];
 
-    const payload = await buildSummaryPayload(userId, fromISO, toISO, productIds);
+    // Admins bypass the per-sub-agent name-sharing privacy gate — the
+    // whole point of the admin console is to see everything.
+    const payload = await buildSummaryPayload(userId, fromISO, toISO, productIds, { bypassRedaction: true });
 
     // Expose who the admin is viewing as (nice for UI / debug)
     res.json({

@@ -6,6 +6,7 @@ import {
   LayoutDashboard, GitBranch, LineChart, Users, BookText, Package,
   DollarSign, UsersRound, Building2, FolderTree, UserCog, ScrollText,
   LogOut, Menu, X, Activity, ClipboardList, BookOpen, Settings, KeyRound,
+  Shield,
 } from 'lucide-react';
 import { useAuth } from '../auth/AuthContext.jsx';
 import NotificationsBell from '../components/NotificationsBell.jsx';
@@ -83,6 +84,7 @@ export default function Layout() {
 
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [showChangePw, setShowChangePw] = useState(false);
+  const [showPrivacy, setShowPrivacy]   = useState(false);
 
   // Auto-close drawer on route change (so tapping a nav item dismisses it)
   useEffect(() => { setDrawerOpen(false); }, [location.pathname]);
@@ -199,6 +201,17 @@ export default function Layout() {
             >
               Password
             </Button>
+            {isAgent && (
+              <Button
+                variant="ghost"
+                size="sm"
+                icon={<Shield size={14} />}
+                onClick={() => setShowPrivacy(true)}
+                title="Control whether your parent agent can see your client names"
+              >
+                Privacy
+              </Button>
+            )}
             <Button variant="ghost" size="sm" icon={<LogOut size={14} />} onClick={logout}>
               Sign out
             </Button>
@@ -207,6 +220,9 @@ export default function Layout() {
       </aside>
       {showChangePw && (
         <ChangePasswordModal onClose={() => setShowChangePw(false)} />
+      )}
+      {showPrivacy && (
+        <PrivacySettingsModal onClose={() => setShowPrivacy(false)} />
       )}
 
       <main className="main">
@@ -326,6 +342,111 @@ function ChangePasswordModal({ onClose }) {
           </div>
         </div>
       </form>
+    </div>
+  );
+}
+
+/**
+ * Privacy settings modal — single toggle for whether the agent's parent
+ * (the agent directly above them in the hierarchy) can see the names of
+ * their clients in views like Summary and Commissions.
+ *
+ * Default is OFF (private). Flipping it ON only affects the parent's
+ * view; admin views always see full names. Audit-logged.
+ */
+function PrivacySettingsModal({ onClose }) {
+  const [enabled, setEnabled] = useState(null);  // null while loading
+  const [loading, setLoading] = useState(true);
+  const [save, { loading: saving }] = useMutation();
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const { api } = await import('../api.js');
+        const me = await api('/api/portal/me');
+        setEnabled(me?.share_client_names_with_parent === true);
+      } catch (err) {
+        toast.error(err.message || 'Failed to load privacy setting');
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, []);
+
+  async function commit(next) {
+    setEnabled(next);  // optimistic
+    try {
+      await save('/api/portal/me/privacy', {
+        method: 'PATCH',
+        body: { share_client_names_with_parent: next },
+      });
+      toast.success(next ? 'Name-sharing enabled' : 'Name-sharing disabled');
+    } catch (err) {
+      setEnabled(!next);  // revert
+      toast.error(err.message || 'Failed to update');
+    }
+  }
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div
+        className="modal-card"
+        style={{ maxWidth: 460 }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="modal-header">
+          <h2 style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <Shield size={18} /> Privacy
+          </h2>
+          <button className="modal-close" onClick={onClose} aria-label="Close">
+            <X size={18} />
+          </button>
+        </div>
+        <div className="pad" style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+          <p className="muted small" style={{ margin: 0 }}>
+            By default, when your parent agent looks at their <b>Summary</b> or
+            <b> Commissions</b> page, they see the <i>volumes</i>, <i>commissions</i>,
+            and <i>MT5 login numbers</i> of your clients — but <b>not their names</b>.
+            Their accounts are still counted in your parent's totals; only the
+            personal identifying info (name, email) is hidden.
+          </p>
+          <p className="muted small" style={{ margin: 0 }}>
+            If you trust your parent agent enough to expose your clients'
+            names to them too, enable the toggle below. You can flip it off
+            again any time.
+          </p>
+
+          <label
+            style={{
+              display: 'flex', alignItems: 'flex-start', gap: 12,
+              padding: 14, border: '1px solid var(--border)',
+              borderRadius: 8, cursor: loading || saving ? 'wait' : 'pointer',
+              background: enabled ? 'color-mix(in srgb, var(--accent) 8%, transparent)' : undefined,
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={enabled === true}
+              disabled={loading || saving || enabled === null}
+              onChange={(e) => commit(e.target.checked)}
+              style={{ width: 18, height: 18, marginTop: 2 }}
+            />
+            <div>
+              <div style={{ fontWeight: 600 }}>
+                Share my clients' names with my parent agent
+              </div>
+              <div className="muted small" style={{ marginTop: 2 }}>
+                Default: off. When off, your parent sees row labels like
+                "MT5 #57755" instead of client names.
+              </div>
+            </div>
+          </label>
+
+          <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 4 }}>
+            <button type="button" className="btn ghost" onClick={onClose}>Close</button>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }

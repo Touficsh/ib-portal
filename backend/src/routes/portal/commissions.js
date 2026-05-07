@@ -52,7 +52,39 @@ router.get('/', async (req, res, next) => {
 
     const whereSQL = where.join(' AND ');
 
-    const [{ rows: items }, { rows: countRows }] = await Promise.all([
+    // Pre-fetch the privacy gate for this viewer:
+    //   for each agent in the viewer's subtree, what's the direct-sub-agent
+    //   between them and the viewer (i.e. which sub-agent "owns" this row's
+    //   visibility decision), and has that sub-agent granted name-sharing?
+    // Source-agents that ARE the viewer get direct_sub_id = null and always
+    // show full names.
+    const { rows: subtreeRows } = await pool.query(
+      `WITH RECURSIVE st AS (
+         SELECT u.id, u.parent_agent_id,
+                CASE WHEN u.parent_agent_id = $1 THEN u.id ELSE NULL END AS direct_sub_id
+         FROM users u
+         WHERE u.parent_agent_id = $1 AND u.is_agent = true
+         UNION ALL
+         SELECT u.id, u.parent_agent_id, st.direct_sub_id
+         FROM users u
+         JOIN st ON u.parent_agent_id = st.id
+         WHERE u.is_agent = true
+       )
+       SELECT st.id AS user_id, st.direct_sub_id,
+              COALESCE(ds.share_client_names_with_parent, false) AS share_with_parent
+       FROM st
+       LEFT JOIN users ds ON ds.id = st.direct_sub_id`,
+      [req.user.id]
+    );
+    // Map: source_agent_id -> { direct_sub_id, share_with_parent }
+    const privacyByAgent = new Map(
+      subtreeRows.map(r => [r.user_id, {
+        direct_sub_id: r.direct_sub_id,
+        share_with_parent: r.share_with_parent,
+      }])
+    );
+
+    const [{ rows: itemsRaw }, { rows: countRows }] = await Promise.all([
       pool.query(
         `SELECT c.id, c.deal_id, c.deal_time, c.client_id, c.mt5_login,
                 c.product_id, p.name AS product_name, p.currency,
@@ -81,6 +113,21 @@ router.get('/', async (req, res, next) => {
         params
       ),
     ]);
+
+    // Apply the privacy redaction. Each row's source_agent_id determines
+    // which sub-agent's flag controls visibility. If source_agent IS viewer
+    // (own direct client) — name visible. Else — the direct sub's flag
+    // decides; redacted rows return name=null + name_redacted=true so the
+    // UI can render "MT5 #<login>" instead of the client's name.
+    const items = itemsRaw.map(row => {
+      const isOwn = row.source_agent_id === req.user.id;
+      const priv = privacyByAgent.get(row.source_agent_id);
+      const canShowName = isOwn
+        || (priv && priv.direct_sub_id === null)
+        || (priv && priv.share_with_parent === true);
+      if (canShowName) return row;
+      return { ...row, client_name: null, name_redacted: true };
+    });
 
     res.json({
       items,

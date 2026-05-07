@@ -28,6 +28,15 @@ CREATE INDEX IF NOT EXISTS idx_users_is_agent        ON users(is_agent) WHERE is
 CREATE INDEX IF NOT EXISTS idx_users_linked_client   ON users(linked_client_id);
 CREATE INDEX IF NOT EXISTS idx_users_crm_ib_wallet_id ON users(crm_ib_wallet_id) WHERE crm_ib_wallet_id IS NOT NULL;
 
+-- Privacy opt-in: when a sub-agent sets this to true, the agent directly
+-- above them can see their full client names in views like Agent Summary
+-- and Commissions. Default false (private). Read by buildSummaryPayload
+-- and the portal commission list endpoint to redact client_name on rows
+-- that fall under a sub-agent who hasn't granted permission. Admin views
+-- bypass this entirely (admins see all PII). See OWNER_HANDBOOK §Privacy.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS share_client_names_with_parent
+  BOOLEAN NOT NULL DEFAULT false;
+
 -- Roles table (RBAC)
 CREATE TABLE IF NOT EXISTS roles (
   id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),

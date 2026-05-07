@@ -20,6 +20,7 @@ router.get('/me', portalAuthenticate, async (req, res, next) => {
     const { rows } = await pool.query(
       `SELECT u.id, u.name, u.email, u.avatar_url, u.role, u.role_id,
               u.parent_agent_id, u.is_agent, u.created_at,
+              u.share_client_names_with_parent,
               p.name AS parent_agent_name
        FROM users u
        LEFT JOIN users p ON p.id = u.parent_agent_id
@@ -64,10 +65,45 @@ router.get('/me', portalAuthenticate, async (req, res, next) => {
       permissions: perms,
       directSubAgents,
       directClients,
+      // Privacy: when true, the parent agent above me sees my full client
+      // names in their Summary / Commissions views. Default false (private).
+      share_client_names_with_parent: me.share_client_names_with_parent === true,
     });
   } catch (err) {
     next(err);
   }
+});
+
+// PATCH /api/portal/me/privacy
+// Lets the agent toggle name-sharing with their parent. Body:
+//   { share_client_names_with_parent: boolean }
+// Audited so we can trace who flipped it when.
+router.patch('/me/privacy', portalAuthenticate, async (req, res, next) => {
+  try {
+    const v = req.body?.share_client_names_with_parent;
+    if (typeof v !== 'boolean') {
+      return res.status(400).json({ error: 'share_client_names_with_parent must be boolean' });
+    }
+    const { rows } = await pool.query(
+      `UPDATE users
+          SET share_client_names_with_parent = $1, updated_at = NOW()
+        WHERE id = $2 AND is_agent = true
+      RETURNING id, share_client_names_with_parent`,
+      [v, req.user.id]
+    );
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Only agents can set this' });
+    }
+
+    await audit(req, {
+      action: 'portal.me.privacy.update',
+      entity_type: 'user',
+      entity_id: req.user.id,
+      metadata: { share_client_names_with_parent: v },
+    });
+
+    res.json({ ok: true, share_client_names_with_parent: rows[0].share_client_names_with_parent });
+  } catch (err) { next(err); }
 });
 
 // POST /api/portal/me/change-password

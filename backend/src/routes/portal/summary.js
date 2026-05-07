@@ -83,7 +83,12 @@ router.get('/', requirePortalPermission('portal.summary.view'), async (req, res,
 // console's /api/admin/agent-summary/:userId route can reuse the same pipeline
 // for an arbitrary agent (the admin picks any agent and sees their summary).
 // The agent-portal route wraps this with req.user.id; both share one code path.
-export async function buildSummaryPayload(viewerUserId, fromISO, toISO, productIds) {
+//
+// `bypassRedaction` (default false) — admin routes pass true so admins see
+// every client name. Agent routes leave it false so sub-agents' clients
+// stay private unless the sub-agent has opted in via
+// users.share_client_names_with_parent.
+export async function buildSummaryPayload(viewerUserId, fromISO, toISO, productIds, { bypassRedaction = false } = {}) {
   const viewerId = viewerUserId;  // kept for readability below
   try {
 
@@ -214,9 +219,12 @@ export async function buildSummaryPayload(viewerUserId, fromISO, toISO, productI
       [viewerId]
     );
 
-    // Pull direct sub-agents + their metadata for the grouping shell
+    // Pull direct sub-agents + their metadata for the grouping shell.
+    // Includes share_client_names_with_parent — the privacy flag a sub-agent
+    // can flip to expose their client names to the viewer (their parent).
     const { rows: directSubs } = await pool.query(
-      `SELECT u.id, u.name, u.email, u.linked_client_id, c.branch
+      `SELECT u.id, u.name, u.email, u.linked_client_id, c.branch,
+              u.share_client_names_with_parent
        FROM users u
        LEFT JOIN clients c ON c.id = u.linked_client_id
        WHERE u.parent_agent_id = $1 AND u.is_agent = true AND u.is_active = true
@@ -232,6 +240,7 @@ export async function buildSummaryPayload(viewerUserId, fromISO, toISO, productI
         name: sa.name,
         email: sa.email,
         branch: sa.branch,
+        share_client_names_with_parent: sa.share_client_names_with_parent === true,
         ownAccounts: [],
         clientsMap: new Map(),
       });
@@ -268,15 +277,24 @@ export async function buildSummaryPayload(viewerUserId, fromISO, toISO, productI
       } else if (r.is_own_account && r.direct_sub_id && subMap.has(r.direct_sub_id)) {
         subMap.get(r.direct_sub_id).ownAccounts.push(account);
       } else if (r.direct_sub_id && subMap.has(r.direct_sub_id)) {
-        // Client row under a sub-agent
+        // Client row under a sub-agent — privacy gate applied here.
+        // Visible if: admin context (bypassRedaction) OR the sub-agent has
+        // granted name-sharing to their parent (the viewer). Otherwise
+        // redact name + email; aggregates (volume/commission) and the
+        // login number stay visible so rows remain meaningful and joinable.
         const sa = subMap.get(r.direct_sub_id);
+        const canSeeNames = bypassRedaction || sa.share_client_names_with_parent === true;
         if (!sa.clientsMap.has(r.client_id)) {
           sa.clientsMap.set(r.client_id, {
             id: r.client_id,
-            name: r.client_name,
-            email: r.client_email,
+            name:  canSeeNames ? r.client_name  : null,
+            email: canSeeNames ? r.client_email : null,
             variant: r.client_variant === 'lead' ? 'lead' : 'client',
             stage: r.client_stage,
+            // True when the sub-agent above this client hasn't granted
+            // name-sharing. UI uses this to render a "name hidden" badge
+            // and show only the login number in the row label.
+            name_redacted: !canSeeNames,
             accounts: [],
           });
         }
