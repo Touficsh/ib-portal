@@ -302,13 +302,24 @@ router.post('/import', async (req, res, next) => {
     autoFinishResult.state = 'done';
     response.auto_finish = autoFinishResult;
 
-    // ─── Step 5 (opt-in): pull individual contacts + trading accounts for the
-    //     freshly imported agents only. Triggered by ?withContacts=1 or
-    //     { withContacts: true } in the body. Scoped to newUserIds, so it
-    //     never re-touches already-synced agents from prior imports. The
-    //     trading-account fetch has a 24h freshness guard.
-    const withContacts = String(req.query.withContacts ?? req.body?.withContacts ?? 'false').toLowerCase() === 'true'
-      || req.query.withContacts === '1';
+    // ─── Step 5 (default-on as of 2026-05-07): pull contacts + leads + MT5
+    //     logins for the freshly imported agents. Scoped to newUserIds, so
+    //     it never re-touches already-synced agents from prior imports.
+    //
+    // Pre-2026-05-07 this was opt-in (`?withContacts=1`). The default flipped
+    // because every realistic "I just imported an agent" expectation includes
+    // their clients — leaving that as a separate step caused agents to look
+    // empty until someone manually triggered a contact sync. Implementation
+    // uses /api/agent-hierarchy (single CRM call per imported agent), so
+    // it's much cheaper than the old per-page /api/contacts sweep.
+    //
+    // Opt-out via `?withContacts=0` (or `withContacts: false`) — useful for
+    // bulk imports where you want to land all agent records first and pull
+    // contacts in a separate, cancellable run.
+    const withContactsRaw = req.query.withContacts ?? req.body?.withContacts;
+    const withContacts = withContactsRaw === undefined
+      ? true                                                                  // default-on
+      : !(String(withContactsRaw).toLowerCase() === 'false' || withContactsRaw === '0' || withContactsRaw === 0 || withContactsRaw === false);
     // Determine which CRM agent IDs to hierarchy-sync. For by-ids mode we use
     // the picked clientIds. For by-branch mode we use processed_client_ids
     // (the recursive pickList from importAgents — top-level agents in the

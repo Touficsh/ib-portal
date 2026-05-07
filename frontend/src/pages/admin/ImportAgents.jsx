@@ -101,7 +101,10 @@ export default function ImportAgents() {
       return;
     }
     const ok = await confirm(
-      `Import all ${pending} pending agents in "${selectedBranch}"? This creates their portal logins.`,
+      `Import all ${pending} pending agents in "${selectedBranch}"?\n\n` +
+      `Step 1 — Create their portal logins\n` +
+      `Step 2 — Sync their commission rates from CRM\n` +
+      `Step 3 — Pull each agent's referred clients + leads + MT5 logins`,
       { confirmLabel: `Import ${pending}`, cancelLabel: 'Cancel' }
     );
     if (!ok) return;
