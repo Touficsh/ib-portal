@@ -12,6 +12,7 @@
 import { Router } from 'express';
 import pool from '../../db/pool.js';
 import { portalAuthenticate, requireAgentAccess } from '../../middleware/portalAuth.js';
+import { getClientPrivacyMap, applyRedaction } from '../../services/clientPrivacy.js';
 
 const router = Router();
 router.use(portalAuthenticate, requireAgentAccess);
@@ -31,6 +32,10 @@ router.get('/', async (req, res, next) => {
     // All counts reference referred_by_agent_id = linked_client_id (the CRM
     // anchor point). Falls back to empty if the agent isn't CRM-linked.
     const lcid = me.linked_client_id;
+
+    // Pre-fetch the privacy gate so top_clients can redact rows owned by
+    // sub-agents who haven't granted name-sharing.
+    const privacyMap = await getClientPrivacyMap(req.user.id);
 
     const [
       { rows: [downline] },
@@ -128,9 +133,11 @@ router.get('/', async (req, res, next) => {
          GROUP BY day ORDER BY day`,
         [req.user.id]
       ),
-      // Top 5 clients by lots (viewer's direct + subtree clients)
+      // Top 5 clients by lots (viewer's direct + subtree clients).
+      // Includes cl.agent_id so the privacy gate can decide whether to
+      // expose this client's name to the viewer.
       pool.query(
-        `SELECT cl.id AS client_id, cl.name AS client_name,
+        `SELECT cl.id AS client_id, cl.name AS client_name, cl.agent_id AS client_agent_id,
                 SUM(c.lots)::numeric(14,2)       AS lots,
                 SUM(c.amount)::numeric(14,2)     AS earnings,
                 COUNT(*)::int                     AS deal_count
@@ -138,7 +145,7 @@ router.get('/', async (req, res, next) => {
          JOIN clients cl ON cl.id = c.client_id
          WHERE c.agent_id = $1
            AND c.deal_time >= date_trunc('month', NOW())
-         GROUP BY cl.id, cl.name
+         GROUP BY cl.id, cl.name, cl.agent_id
          ORDER BY lots DESC
          LIMIT 5`,
         [req.user.id]
@@ -220,13 +227,25 @@ router.get('/', async (req, res, next) => {
       parent_name: me.parent_name || null,
       // New sections — fuel the richer Dashboard
       earnings_daily: dailySeries,
-      top_clients:    topClients.map(r => ({
-        client_id: r.client_id,
-        client_name: r.client_name,
-        lots: Number(r.lots),
-        earnings: Number(r.earnings),
-        deal_count: r.deal_count,
-      })),
+      // Top clients: apply the privacy gate so a client whose owning
+      // agent (typically a sub-agent of the viewer) hasn't granted
+      // name-sharing shows as "MT5 #login" / "Hidden" client on the
+      // dashboard. The viewer's own direct clients always show.
+      top_clients:    topClients.map(r => {
+        const priv = privacyMap.get(r.client_agent_id);
+        const canShow = !r.client_agent_id
+          || r.client_agent_id === req.user.id
+          || !priv
+          || priv.share_with_parent === true;
+        return {
+          client_id: r.client_id,
+          client_name: canShow ? r.client_name : null,
+          name_redacted: !canShow,
+          lots: Number(r.lots),
+          earnings: Number(r.earnings),
+          deal_count: r.deal_count,
+        };
+      }),
       pipeline_funnel: funnel,
       sub_agent_leaderboard: subAgentLeaders.map(r => ({
         agent_id: r.agent_id,

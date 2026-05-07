@@ -19,6 +19,7 @@
 import { Router } from 'express';
 import * as XLSX from 'xlsx';
 import pool from '../../db/pool.js';
+import { getClientPrivacyMap } from '../../services/clientPrivacy.js';
 import { portalAuthenticate, requireAgentAccess, requirePortalAdmin } from '../../middleware/portalAuth.js';
 import { syncForAgent } from '../../services/tradingAccountMetaSync.js';
 
@@ -484,7 +485,7 @@ router.get('/', async (req, res, next) => {
     }
     const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
 
-    const [{ rows: items }, { rows: [count] }, { rows: breakdown }] = await Promise.all([
+    const [{ rows: itemsRaw }, { rows: [count] }, { rows: breakdown }] = await Promise.all([
       pool.query(
         `${baseSql}
          SELECT * FROM flattened ${whereSql}
@@ -504,6 +505,28 @@ router.get('/', async (req, res, next) => {
         [req.user.id, me.linked_client_id]
       ),
     ]);
+
+    // Apply the privacy gate: each row's agent_user_id tells us who owns
+    // this trading account. If owner is the viewer (mine/direct_client) or
+    // a sub-agent who's granted name-sharing, names show. Otherwise the
+    // client row is anonymized to "MT5 #<login>" while the row itself
+    // (login number, balance, lots, commission) stays visible.
+    const privacyMap = await getClientPrivacyMap(req.user.id);
+    const items = itemsRaw.map(r => {
+      const ownerId = r.agent_user_id;
+      const isMine  = ownerId === req.user.id;
+      const priv    = privacyMap.get(ownerId);
+      const canShow = isMine || !priv || priv.share_with_parent === true;
+      if (canShow) return r;
+      return {
+        ...r,
+        client_name: null,
+        email: null,
+        phone: null,
+        agent_name: null,        // also hide which sub-agent ultimately
+        name_redacted: true,
+      };
+    });
 
     const counts = { mine: 0, direct_client: 0, subagent: 0, subagent_client: 0 };
     for (const b of breakdown) counts[b.source] = b.c;

@@ -103,7 +103,17 @@ router.get('/:id/clients', async (req, res, next) => {
     if (productId) { where.push(`cl.product_id = $${i++}`);      params.push(productId); }
     const whereSQL = where.join(' AND ');
 
-    const [{ rows: items }, { rows: countRows }] = await Promise.all([
+    // Privacy: this endpoint shows a SUB-AGENT'S direct clients. By
+    // definition every row belongs to that sub-agent — apply a single
+    // visibility check based on the sub-agent's share_client_names_with_parent
+    // flag. If they haven't granted, redact every row's name + email.
+    const { rows: [subShareRow] } = await pool.query(
+      `SELECT share_client_names_with_parent FROM users WHERE id = $1`,
+      [req.params.id]
+    );
+    const subShares = subShareRow?.share_client_names_with_parent === true;
+
+    const [{ rows: itemsRaw }, { rows: countRows }] = await Promise.all([
       pool.query(
         `SELECT cl.id, cl.name, cl.email, cl.phone, cl.country,
                 cl.pipeline_stage, cl.is_verified, cl.is_trader,
@@ -127,6 +137,16 @@ router.get('/:id/clients', async (req, res, next) => {
         params
       ),
     ]);
+
+    const items = subShares
+      ? itemsRaw
+      : itemsRaw.map(r => ({
+          ...r,
+          name: null,
+          email: null,
+          phone: null,           // phone is also PII — redact too
+          name_redacted: true,
+        }));
 
     res.json({
       items: items.map(row => ({
