@@ -6,7 +6,7 @@ import {
   LayoutDashboard, GitBranch, LineChart, Users, BookText, Package,
   DollarSign, UsersRound, Building2, FolderTree, UserCog, ScrollText,
   LogOut, Menu, X, Activity, ClipboardList, BookOpen, Settings, KeyRound,
-  Shield,
+  Shield, Eye, EyeOff, Lock,
 } from 'lucide-react';
 import { useAuth } from '../auth/AuthContext.jsx';
 import NotificationsBell from '../components/NotificationsBell.jsx';
@@ -347,15 +347,22 @@ function ChangePasswordModal({ onClose }) {
 }
 
 /**
- * Privacy settings modal — single toggle for whether the agent's parent
- * (the agent directly above them in the hierarchy) can see the names of
- * their clients in views like Summary and Commissions.
+ * Privacy settings modal — single switch controlling whether the agent
+ * directly above this user can see this user's clients' names in views
+ * like Summary, Commissions, Dashboard top-clients, and Trading Accounts.
  *
- * Default is OFF (private). Flipping it ON only affects the parent's
- * view; admin views always see full names. Audit-logged.
+ * Visible only to agent accounts (not pure admin accounts).
+ *
+ * Three things the redesign makes obvious:
+ *  - WHO is affected — the parent agent is named explicitly
+ *  - CURRENT STATE — a status pill at the top says "Names are hidden"
+ *    or "Names are visible to <parent>"
+ *  - WHAT CHANGES — a side-by-side "what they see now / what they'd
+ *    see if you enable it" example
  */
 function PrivacySettingsModal({ onClose }) {
-  const [enabled, setEnabled] = useState(null);  // null while loading
+  const [me, setMe]           = useState(null);
+  const [enabled, setEnabled] = useState(null);
   const [loading, setLoading] = useState(true);
   const [save, { loading: saving }] = useMutation();
 
@@ -363,8 +370,9 @@ function PrivacySettingsModal({ onClose }) {
     (async () => {
       try {
         const { api } = await import('../api.js');
-        const me = await api('/api/portal/me');
-        setEnabled(me?.share_client_names_with_parent === true);
+        const r = await api('/api/portal/me');
+        setMe(r);
+        setEnabled(r?.share_client_names_with_parent === true);
       } catch (err) {
         toast.error(err.message || 'Failed to load privacy setting');
       } finally {
@@ -380,18 +388,25 @@ function PrivacySettingsModal({ onClose }) {
         method: 'PATCH',
         body: { share_client_names_with_parent: next },
       });
-      toast.success(next ? 'Name-sharing enabled' : 'Name-sharing disabled');
+      toast.success(
+        next
+          ? 'Your client names are now visible to your parent agent.'
+          : 'Your client names are hidden from your parent agent.'
+      );
     } catch (err) {
       setEnabled(!next);  // revert
       toast.error(err.message || 'Failed to update');
     }
   }
 
+  const parentName = me?.parent_agent_name;
+  const hasParent  = Boolean(me?.parent_agent_id);
+
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div
         className="modal-card"
-        style={{ maxWidth: 460 }}
+        style={{ maxWidth: 520 }}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="modal-header">
@@ -402,45 +417,116 @@ function PrivacySettingsModal({ onClose }) {
             <X size={18} />
           </button>
         </div>
-        <div className="pad" style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-          <p className="muted small" style={{ margin: 0 }}>
-            By default, when your parent agent looks at their <b>Summary</b> or
-            <b> Commissions</b> page, they see the <i>volumes</i>, <i>commissions</i>,
-            and <i>MT5 login numbers</i> of your clients — but <b>not their names</b>.
-            Their accounts are still counted in your parent's totals; only the
-            personal identifying info (name, email) is hidden.
-          </p>
-          <p className="muted small" style={{ margin: 0 }}>
-            If you trust your parent agent enough to expose your clients'
-            names to them too, enable the toggle below. You can flip it off
-            again any time.
-          </p>
 
-          <label
-            style={{
-              display: 'flex', alignItems: 'flex-start', gap: 12,
-              padding: 14, border: '1px solid var(--border)',
-              borderRadius: 8, cursor: loading || saving ? 'wait' : 'pointer',
-              background: enabled ? 'color-mix(in srgb, var(--accent) 8%, transparent)' : undefined,
-            }}
-          >
-            <input
-              type="checkbox"
-              checked={enabled === true}
-              disabled={loading || saving || enabled === null}
-              onChange={(e) => commit(e.target.checked)}
-              style={{ width: 18, height: 18, marginTop: 2 }}
-            />
-            <div>
-              <div style={{ fontWeight: 600 }}>
-                Share my clients' names with my parent agent
+        <div className="pad" style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+          {/* No parent → no privacy decision to make. Explain and exit. */}
+          {!loading && !hasParent && (
+            <div
+              style={{
+                padding: 14,
+                border: '1px solid var(--border)',
+                borderRadius: 8,
+                background: 'var(--bg-elev-1)',
+              }}
+            >
+              <div style={{ fontWeight: 600, marginBottom: 4 }}>
+                You don't have a parent agent.
               </div>
-              <div className="muted small" style={{ marginTop: 2 }}>
-                Default: off. When off, your parent sees row labels like
-                "MT5 #57755" instead of client names.
+              <div className="muted small">
+                You're at the top of your tree — there's no one above you who
+                could see your clients. This privacy control only matters if
+                someone is your parent in the hierarchy.
               </div>
             </div>
-          </label>
+          )}
+
+          {/* Status pill — visible at the top so the user knows immediately */}
+          {!loading && hasParent && (
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 10,
+                padding: '12px 14px',
+                borderRadius: 8,
+                border: '1px solid var(--border)',
+                background: enabled
+                  ? 'color-mix(in srgb, var(--success, #16a34a) 10%, transparent)'
+                  : 'var(--bg-elev-1)',
+              }}
+            >
+              {enabled ? <Eye size={16} /> : <EyeOff size={16} />}
+              <div>
+                <div style={{ fontWeight: 600, fontSize: 13 }}>
+                  {enabled ? 'Names visible' : 'Names hidden'}
+                </div>
+                <div className="muted small" style={{ marginTop: 1 }}>
+                  {enabled
+                    ? <>Your parent <b>{parentName || '(parent)'}</b> can currently see your clients' names.</>
+                    : <>Your parent <b>{parentName || '(parent)'}</b> sees row labels like <span className="mono">MT5 #57755</span> — names and emails are hidden.</>
+                  }
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* The toggle */}
+          {hasParent && (
+            <label
+              className="ui-toggle-card"
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 14,
+                padding: 14,
+                border: '1px solid var(--border)',
+                borderRadius: 8,
+                cursor: loading || saving ? 'wait' : 'pointer',
+              }}
+            >
+              <span className="ui-switch">
+                <input
+                  type="checkbox"
+                  checked={enabled === true}
+                  disabled={loading || saving || enabled === null}
+                  onChange={(e) => commit(e.target.checked)}
+                />
+                <span className="ui-switch-track" />
+              </span>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontWeight: 600 }}>
+                  Share client names with my parent agent
+                </div>
+                <div className="muted small" style={{ marginTop: 2 }}>
+                  Even when off, your parent <b>still sees</b> volumes,
+                  commissions, balances, and MT5 logins — only personal
+                  identifying info (names, emails, phone numbers) is hidden.
+                </div>
+              </div>
+            </label>
+          )}
+
+          {/* What does the parent actually see — small example */}
+          {hasParent && (
+            <div
+              style={{
+                padding: 12,
+                border: '1px dashed var(--border)',
+                borderRadius: 8,
+                fontSize: 12,
+              }}
+            >
+              <div className="muted" style={{ textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6, fontSize: 10 }}>
+                Example: a row in your parent's Summary
+              </div>
+              <div className="mono" style={{ fontSize: 12 }}>
+                {enabled
+                  ? <>Marielle Boutros &nbsp;·&nbsp; MT5 #57755 &nbsp;·&nbsp; 3.75 lots &nbsp;·&nbsp; $37.50</>
+                  : <><Lock size={11} style={{ verticalAlign: -1 }} /> MT5 #57755 &nbsp;·&nbsp; 3.75 lots &nbsp;·&nbsp; $37.50</>
+                }
+              </div>
+            </div>
+          )}
 
           <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 4 }}>
             <button type="button" className="btn ghost" onClick={onClose}>Close</button>

@@ -1,6 +1,6 @@
 import { Fragment, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { ChevronsDown, ChevronsUp, RefreshCw, Download, Filter } from 'lucide-react';
+import { ChevronsDown, ChevronsUp, RefreshCw, Download, Filter, Lock } from 'lucide-react';
 import { useApi, useMutation, useAutoRefresh } from '../hooks/useApi.js';
 import LastUpdated from '../components/LastUpdated.jsx';
 import Button from '../components/ui/Button.jsx';
@@ -102,15 +102,15 @@ export function ClientRow({ c, depth, expanded, onToggle }) {
   const avatarClass = c.variant === 'lead' ? 'sum-avatar-lead' : 'sum-avatar-client';
   const label = c.variant === 'lead' ? 'Lead' : 'Client';
   // When the row is from a sub-agent who hasn't granted name-sharing,
-  // c.name comes back null and c.name_redacted=true. Show the first
-  // login number as a stable identifier and an explainer tooltip.
+  // c.name is null and c.name_redacted=true. Show "MT5 #<login>" as
+  // the row's stable identifier and a small Lock icon in the avatar.
   const isRedacted  = c.name_redacted === true;
   const firstLogin  = c.accounts?.[0]?.login || null;
   const displayName = isRedacted
     ? (firstLogin ? `MT5 #${firstLogin}` : 'Hidden client')
     : (c.name || '—');
   const subText = isRedacted
-    ? `Name hidden — sub-agent hasn't granted name-sharing${c.accounts?.length > 1 ? ` · ${c.accounts.length} accounts` : ''}`
+    ? `Name hidden by sub-agent's privacy setting${c.accounts?.length > 1 ? ` · ${c.accounts.length} accounts` : ''}`
     : `${c.email || '—'}${c.stage ? ` · ${c.stage}` : ''}`;
   return (
     <tr
@@ -122,10 +122,13 @@ export function ClientRow({ c, depth, expanded, onToggle }) {
         <div className="sum-name" style={{ paddingLeft: depth * 28 }}>
           <ExpandBtn expanded={expanded} onClick={onToggle} disabled={!c.accounts?.length} />
           <div className={`sum-avatar ${avatarClass}`}>
-            {isRedacted ? '🔒' : (c.name || '?')[0].toUpperCase()}
+            {isRedacted
+              ? <Lock size={13} aria-label="Hidden client name" />
+              : (c.name || '?')[0].toUpperCase()
+            }
           </div>
           <div className="sum-lines">
-            <div className="sum-name-main" style={isRedacted ? { fontStyle: 'italic' } : undefined}>
+            <div className="sum-name-main" style={isRedacted ? { fontStyle: 'italic', color: 'var(--text-muted)' } : undefined}>
               {displayName}
             </div>
             <div className="muted small">{subText}</div>
