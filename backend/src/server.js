@@ -213,6 +213,13 @@ async function start() {
   const { default: mt5WebhookRoutes } = await import('./routes/mt5Webhook.js');
   app.use('/api/mt5/webhook', mt5WebhookRoutes);
 
+  // ── MT5 live data routes (auth-protected) ──────────────────────────
+  // GET /api/mt5/accounts/:login — live balance/equity for a single login.
+  // Used by the Trading Accounts page's "Refresh" button. Bridge-backed
+  // through mt5BridgeGate so it respects the kill switch + rate limits.
+  const { default: mt5Routes } = await import('./routes/mt5.js');
+  app.use('/api/mt5', mt5Routes);
+
   // ── Internal endpoint for the MT5 bridge ───────────────────────────
   // Localhost-only, no auth — the bridge polls this on startup / reconnect
   // to fetch its MT5 manager credentials from the portal's `settings` table.

@@ -228,14 +228,13 @@ export default function TradingAccounts() {
               <th>FTD</th>
               <th className="num">Balance</th>
               <th className="num">Equity</th>
-              <th className="num">Profit</th>
               <th></th>
             </tr>
           </thead>
           <tbody>
-            {loading && <tr><td colSpan="13" className="muted pad">Loading…</td></tr>}
+            {loading && <tr><td colSpan="12" className="muted pad">Loading…</td></tr>}
             {!loading && items.length === 0 && (
-              <tr><td colSpan="13" className="muted pad">No accounts match the current filter.</td></tr>
+              <tr><td colSpan="12" className="muted pad">No accounts match the current filter.</td></tr>
             )}
             {items.map((r, idx) => {
               const live = liveByLogin[r.mt5_login];
@@ -272,15 +271,6 @@ export default function TradingAccounts() {
                   <td>{r.first_deposit_at ? '✓' : '—'}</td>
                   <td className="num mono">{hasLive ? Number(live.balance).toFixed(2) : '—'}</td>
                   <td className="num mono">{hasLive ? Number(live.equity).toFixed(2) : '—'}</td>
-                  <td
-                    className="num mono"
-                    style={{
-                      color: hasLive && live.profit < 0 ? 'var(--danger)'
-                           : hasLive && live.profit > 0 ? 'var(--success)' : undefined,
-                    }}
-                  >
-                    {hasLive ? Number(live.profit).toFixed(2) : '—'}
-                  </td>
                   <td className="num">
                     {live?._stub ? <span className="muted small">bridge down</span>
                      : live?._error ? <span style={{ color: 'var(--danger)' }} className="small">err</span>
