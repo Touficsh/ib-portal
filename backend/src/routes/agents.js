@@ -17,6 +17,7 @@
  * for cycles before committing.
  */
 import { Router } from 'express';
+import * as XLSX from 'xlsx';
 import pool from '../db/pool.js';
 import { authenticate, requirePermission } from '../middleware/auth.js';
 import { bustPermissionCache } from '../services/permissions.js';
@@ -1239,6 +1240,146 @@ router.get('/hierarchy', cacheMw({ ttl: 60 }), async (req, res, next) => {
       total_links: links.length,
       branch_filter: branchFilter,
     });
+  } catch (err) { next(err); }
+});
+
+/**
+ * GET /api/agents/export.xlsx
+ *
+ * Excel export of the full agent network — same data as /hierarchy but
+ * flattened into one row per agent (parent on its own row, children below
+ * with a Depth column for indentation). Respects the optional branch
+ * filter (?branch=<name>).
+ *
+ * Useful for offline analysis, share-with-finance, audit snapshots etc.
+ *
+ * Columns (in order):
+ *   # | Depth | Name | Email | Branch | Country | Parent agent | Status |
+ *   Direct clients | Direct sub-agents | Subtree sub-agents |
+ *   Products (count + comma list) | Rates per product
+ */
+router.get('/export.xlsx', async (req, res, next) => {
+  try {
+    const branchFilter = req.query.branch ? String(req.query.branch) : null;
+
+    // Re-use the exact same query shape as /hierarchy so the export
+    // can't drift from what the UI shows. (Could refactor /hierarchy
+    // into a service to share the implementation; for now mirror.)
+    const [{ rows: agents }, { rows: links }] = await Promise.all([
+      pool.query(
+        `SELECT u.id, u.name, u.email, u.parent_agent_id, u.is_active,
+                c.branch, c.country, c.phone,
+                p.name AS parent_name,
+                (SELECT COUNT(*)::int FROM clients cl WHERE cl.agent_id = u.id) AS direct_clients_count,
+                (SELECT COUNT(*)::int FROM users sub
+                   WHERE sub.parent_agent_id = u.id AND sub.is_agent = true) AS direct_sub_count
+         FROM users u
+         LEFT JOIN clients c ON c.id = u.linked_client_id
+         LEFT JOIN users   p ON p.id = u.parent_agent_id
+         WHERE u.is_agent = true AND u.linked_client_id IS NOT NULL
+         ORDER BY direct_clients_count DESC, u.name`
+      ),
+      pool.query(
+        `SELECT ap.agent_id, ap.rate_per_lot, p.name AS product_name, p.currency
+         FROM agent_products ap
+         JOIN products p ON p.id = ap.product_id
+         WHERE ap.is_active = true
+         ORDER BY p.name`
+      ),
+    ]);
+
+    // Group products by agent for quick lookup during tree walk
+    const productsByAgent = new Map();
+    for (const l of links) {
+      const arr = productsByAgent.get(l.agent_id) || [];
+      arr.push({ name: l.product_name, rate: Number(l.rate_per_lot), currency: l.currency });
+      productsByAgent.set(l.agent_id, arr);
+    }
+
+    // Stitch parent -> children
+    const byId = new Map();
+    for (const a of agents) byId.set(a.id, { ...a, children: [] });
+    const roots = [];
+    for (const a of agents) {
+      const node = byId.get(a.id);
+      if (a.parent_agent_id && byId.has(a.parent_agent_id)) {
+        byId.get(a.parent_agent_id).children.push(node);
+      } else {
+        roots.push(node);
+      }
+    }
+    const filteredRoots = branchFilter
+      ? roots.filter(r => (r.branch || '') === branchFilter)
+      : roots;
+
+    // Compute subtree sub-agent counts (depth-2+)
+    function tally(node) {
+      let count = node.children.length;
+      for (const c of node.children) count += tally(c);
+      node.subtree_sub_count = count;
+      return count;
+    }
+    filteredRoots.forEach(tally);
+
+    // Depth-first walk -> flat rows. Indentation via the Depth column
+    // (Excel users can sort/filter, but readers also get visual hierarchy
+    // from the indented "Name" cell — prefixed with two spaces per level).
+    const exportRows = [];
+    let rowNum = 0;
+    function visit(node, depth) {
+      const products = productsByAgent.get(node.id) || [];
+      const productNames = products.map(p => p.name).join(', ');
+      const productRates = products
+        .map(p => `${p.name}: ${p.rate.toFixed(2)} ${p.currency || ''}/lot`)
+        .join(' · ');
+      rowNum += 1;
+      exportRows.push({
+        '#':                rowNum,
+        'Depth':            depth,
+        'Name':             '  '.repeat(depth) + (node.name || ''),
+        'Email':            node.email || '',
+        'Branch':           node.branch || '',
+        'Country':          node.country || '',
+        'Phone':            node.phone || '',
+        'Parent agent':     node.parent_name || (depth === 0 ? '(root)' : ''),
+        'Active':           node.is_active ? 'Yes' : 'No',
+        'Direct clients':   Number(node.direct_clients_count) || 0,
+        'Direct sub-agents':Number(node.direct_sub_count) || 0,
+        'Subtree sub-agents': Number(node.subtree_sub_count) || 0,
+        'Products':         products.length,
+        'Product list':     productNames,
+        'Rates':            productRates,
+      });
+      for (const c of node.children) visit(c, depth + 1);
+    }
+    for (const r of filteredRoots) visit(r, 0);
+
+    const ws = XLSX.utils.json_to_sheet(exportRows);
+    // Column widths chosen so the sheet opens cleanly in Excel/Numbers
+    ws['!cols'] = [
+      { wch:  6 }, { wch:  7 }, { wch: 32 }, { wch: 28 }, { wch: 16 },
+      { wch: 14 }, { wch: 16 }, { wch: 26 }, { wch:  8 },
+      { wch: 12 }, { wch: 14 }, { wch: 16 }, { wch:  9 },
+      { wch: 40 }, { wch: 60 },
+    ];
+    // Freeze the header row so big networks stay readable when scrolled
+    ws['!freeze'] = { xSplit: 0, ySplit: 1 };
+    ws['!autofilter'] = { ref: ws['!ref'] };
+
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Agent Network');
+    const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+
+    const slug = branchFilter
+      ? branchFilter.replace(/[^a-z0-9]+/gi, '-').toLowerCase()
+      : 'all';
+    const today = new Date().toISOString().slice(0, 10);
+    const filename = `agent-network_${slug}_${today}.xlsx`;
+
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('X-Row-Count', String(exportRows.length));
+    res.send(buf);
   } catch (err) { next(err); }
 });
 

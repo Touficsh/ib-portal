@@ -2,10 +2,12 @@ import { useState, useMemo, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import {
   AlertCircle, CheckCircle2, Package, CornerUpLeft, UsersRound, Ban, Filter as FilterIcon,
-  LayoutList, LayoutGrid,
+  LayoutList, LayoutGrid, Download,
 } from 'lucide-react';
 import { useApi, useAutoRefresh } from '../../hooks/useApi.js';
 import LastUpdated from '../../components/LastUpdated.jsx';
+import { getToken } from '../../api.js';
+import { toast } from '../../components/ui/toast.js';
 
 /**
  * Admin — Agent Network
@@ -257,6 +259,42 @@ export default function AgentNetwork() {
   const [statusMode, setStatusMode] = useState('all');
   const [clientCountFilter, setClientCountFilter] = useState('all');
   const [expandedMap, setExpandedMap] = useState({});
+  const [exporting, setExporting] = useState(false);
+
+  // Stream the .xlsx via fetch (so we can attach the Bearer header), then
+  // pull the filename from Content-Disposition and trigger a browser download.
+  // Respects the current branch filter — if no branch is selected, exports
+  // the whole network in one file.
+  async function onExport() {
+    setExporting(true);
+    try {
+      const url = '/api/agents/export.xlsx'
+        + (branchFilter ? `?branch=${encodeURIComponent(branchFilter)}` : '');
+      const res = await fetch(url, {
+        headers: { Authorization: `Bearer ${getToken()}` },
+      });
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(text || `HTTP ${res.status}`);
+      }
+      const cd = res.headers.get('Content-Disposition') || '';
+      const m  = cd.match(/filename="([^"]+)"/);
+      const filename = m ? m[1] : 'agent-network.xlsx';
+      const blob = await res.blob();
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(link.href);
+      toast.success(`Exported ${res.headers.get('X-Row-Count') || ''} agents`);
+    } catch (err) {
+      toast.error('Export failed: ' + (err.message || 'unknown'));
+    } finally {
+      setExporting(false);
+    }
+  }
 
   const { data, loading, refetch, dataAt } = useApi(
     '/api/agents/hierarchy',
@@ -364,6 +402,19 @@ export default function AgentNetwork() {
         </div>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
           <LastUpdated dataAt={dataAt} loading={loading} />
+          <button
+            className="btn ghost"
+            onClick={onExport}
+            disabled={exporting || loading}
+            title={branchFilter
+              ? `Download all agents in "${branchFilter}" branch as .xlsx`
+              : 'Download the full agent network as .xlsx'
+            }
+            style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+          >
+            <Download size={13} />
+            {exporting ? 'Exporting…' : 'Export to Excel'}
+          </button>
           {/* Mode toggle */}
           <div
             role="tablist"
