@@ -16,7 +16,9 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:5201', credentials: true }));
-app.use(express.json());
+// 1MB body limit (default is 100KB) — comfortably fits the Agent Network
+// Excel export's POST'd ID list even with tens of thousands of agents.
+app.use(express.json({ limit: '1mb' }));
 
 // Request-scoped structured logger with auto request-id correlation.
 // Use `req.log.info(...)` inside route handlers to get request-id binding.

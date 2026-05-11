@@ -263,15 +263,42 @@ export default function AgentNetwork() {
 
   // Stream the .xlsx via fetch (so we can attach the Bearer header), then
   // pull the filename from Content-Disposition and trigger a browser download.
-  // Respects the current branch filter — if no branch is selected, exports
-  // the whole network in one file.
+  // POSTs the IDs of every visible agent (computed by useMemo below) so the
+  // export matches *exactly* what's on screen: branch + text + status +
+  // client-count filters all honored.
   async function onExport() {
     setExporting(true);
     try {
-      const url = '/api/agents/export.xlsx'
-        + (branchFilter ? `?branch=${encodeURIComponent(branchFilter)}` : '');
-      const res = await fetch(url, {
-        headers: { Authorization: `Bearer ${getToken()}` },
+      // Walk the on-screen tree to collect agent IDs in tree order. This is
+      // a superset of `visibleIds` ordered to match the page (the backend
+      // re-walks the full DB tree and intersects against this set).
+      const ids = [];
+      function collect(node) {
+        ids.push(node.id);
+        for (const c of (node.children || [])) collect(c);
+      }
+      filteredRoots.forEach(collect);
+
+      // Build a human label that captures which filters are on — used by
+      // the backend to compose the filename so multiple back-to-back exports
+      // (different filters) don't clobber each other.
+      const labelParts = [];
+      if (statusMode !== 'all')        labelParts.push(STATUS_FILTERS[statusMode]?.label || statusMode);
+      if (clientCountFilter !== 'all') labelParts.push(`clients-${clientCountFilter}`);
+      if (textFilter.trim())           labelParts.push(`search-${textFilter.trim().slice(0, 20)}`);
+      const label = labelParts.length > 0 ? labelParts.join('_') : null;
+
+      const res = await fetch('/api/agents/export.xlsx', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${getToken()}`,
+          'Content-Type':  'application/json',
+        },
+        body: JSON.stringify({
+          ids,                                       // visible set from this page
+          branch: branchFilter || undefined,         // for filename hint
+          label,                                     // for filename hint
+        }),
       });
       if (!res.ok) {
         const text = await res.text().catch(() => '');
@@ -288,7 +315,7 @@ export default function AgentNetwork() {
       link.click();
       document.body.removeChild(link);
       URL.revokeObjectURL(link.href);
-      toast.success(`Exported ${res.headers.get('X-Row-Count') || ''} agents`);
+      toast.success(`Exported ${res.headers.get('X-Row-Count') || ids.length} agents`);
     } catch (err) {
       toast.error('Export failed: ' + (err.message || 'unknown'));
     } finally {

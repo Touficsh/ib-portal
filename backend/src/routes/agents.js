@@ -1244,23 +1244,37 @@ router.get('/hierarchy', cacheMw({ ttl: 60 }), async (req, res, next) => {
 });
 
 /**
- * GET /api/agents/export.xlsx
+ * POST /api/agents/export.xlsx
  *
- * Excel export of the full agent network — same data as /hierarchy but
- * flattened into one row per agent (parent on its own row, children below
- * with a Depth column for indentation). Respects the optional branch
- * filter (?branch=<name>).
+ * Excel export of the agent network. The frontend page has 4 interacting
+ * filters (branch, status, client-count bucket, text search) — replicating
+ * all that filter logic on the backend would be both tedious and brittle.
+ * Instead, the page walks its already-filtered tree and POSTs the visible
+ * agent IDs in the request body. We export exactly those rows.
  *
- * Useful for offline analysis, share-with-finance, audit snapshots etc.
+ * Body (all optional):
+ *   { ids?: string[]          — agent UUIDs that should appear in the export.
+ *                                If absent, falls back to the branch filter.
+ *     branch?: string          — branch name for filename + fallback scoping
+ *     label?: string }         — optional descriptor used in the filename
  *
- * Columns (in order):
- *   # | Depth | Name | Email | Branch | Country | Parent agent | Status |
- *   Direct clients | Direct sub-agents | Subtree sub-agents |
- *   Products (count + comma list) | Rates per product
+ * Columns:
+ *   # | Depth | Name | Email | Branch | Country | Phone | Parent agent |
+ *   Active | Direct clients | Direct sub-agents | Subtree sub-agents |
+ *   Products (count) | Product list | Rates
+ *
+ * GET /api/agents/export.xlsx is preserved as an alias for "no filter" /
+ * branch-only exports (handy for command-line testing or direct links).
  */
-router.get('/export.xlsx', async (req, res, next) => {
+router.post('/export.xlsx', async (req, res, next) => exportXlsxHandler(req, res, next));
+router.get ('/export.xlsx', async (req, res, next) => exportXlsxHandler(req, res, next));
+
+async function exportXlsxHandler(req, res, next) {
   try {
-    const branchFilter = req.query.branch ? String(req.query.branch) : null;
+    const body         = req.body || {};
+    const idsAllow     = Array.isArray(body.ids) ? new Set(body.ids.map(String)) : null;
+    const branchFilter = (body.branch || req.query.branch) ? String(body.branch || req.query.branch) : null;
+    const labelFromUI  = body.label ? String(body.label).slice(0, 60) : null;
 
     // Re-use the exact same query shape as /hierarchy so the export
     // can't drift from what the UI shows. (Could refactor /hierarchy
@@ -1324,9 +1338,23 @@ router.get('/export.xlsx', async (req, res, next) => {
     // Depth-first walk -> flat rows. Indentation via the Depth column
     // (Excel users can sort/filter, but readers also get visual hierarchy
     // from the indented "Name" cell — prefixed with two spaces per level).
+    //
+    // If `idsAllow` is non-null (POST'd from the page with the visible
+    // subset), include ONLY agents in that Set. Depth = count of ALLOWED
+    // ancestors above this agent, so skipped parents collapse cleanly:
+    // a "needs setup" sub-agent whose parent is configured shows up at
+    // depth 0 in the export (becomes its own root) instead of being
+    // orphaned mid-tree.
     const exportRows = [];
     let rowNum = 0;
-    function visit(node, depth) {
+    function visit(node, allowedAncestors) {
+      const isAllowed = !idsAllow || idsAllow.has(node.id);
+      const nextAncestors = isAllowed ? allowedAncestors + 1 : allowedAncestors;
+      if (!isAllowed) {
+        for (const c of node.children) visit(c, nextAncestors);
+        return;
+      }
+      const depth = allowedAncestors;  // emit at the allowed-ancestor count
       const products = productsByAgent.get(node.id) || [];
       const productNames = products.map(p => p.name).join(', ');
       const productRates = products
@@ -1350,7 +1378,7 @@ router.get('/export.xlsx', async (req, res, next) => {
         'Product list':     productNames,
         'Rates':            productRates,
       });
-      for (const c of node.children) visit(c, depth + 1);
+      for (const c of node.children) visit(c, nextAncestors);
     }
     for (const r of filteredRoots) visit(r, 0);
 
@@ -1370,18 +1398,23 @@ router.get('/export.xlsx', async (req, res, next) => {
     XLSX.utils.book_append_sheet(wb, ws, 'Agent Network');
     const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
 
+    // Filename composes branch + optional label (e.g. "needs-setup")
+    // so back-to-back exports with different filters land as separate files.
     const slug = branchFilter
       ? branchFilter.replace(/[^a-z0-9]+/gi, '-').toLowerCase()
       : 'all';
+    const labelSlug = labelFromUI
+      ? '_' + labelFromUI.replace(/[^a-z0-9]+/gi, '-').toLowerCase().slice(0, 30)
+      : '';
     const today = new Date().toISOString().slice(0, 10);
-    const filename = `agent-network_${slug}_${today}.xlsx`;
+    const filename = `agent-network_${slug}${labelSlug}_${today}.xlsx`;
 
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.setHeader('X-Row-Count', String(exportRows.length));
     res.send(buf);
   } catch (err) { next(err); }
-});
+}
 
 // GET /api/agents — list all agents with parent name + direct counts + linked-product count
 router.get('/', cacheMw({ ttl: 60 }), async (req, res, next) => {
