@@ -8,6 +8,11 @@ Standalone IB (Introducing Broker) Agent Portal extracted from the live-crm-sale
 > No coding required.
 >
 > **Setting up or developing on it?** Continue reading.
+>
+> **Taking the portal live on the public internet?** See
+> [DEPLOYMENT.md](DEPLOYMENT.md) — step-by-step runbook covering
+> domain, HTTPS via Caddy, NSSM services, hardening, cutover, and
+> rollback. ~3-4 hours start to finish.
 
 ## Architecture
 

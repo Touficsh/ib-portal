@@ -298,7 +298,73 @@ configuration.
 
 ---
 
-## 9. Things only your developer should touch
+## 9. Privacy — who sees which client names
+
+This system has a privacy layer that protects sub-agents' clients from
+being visible by name to the agent above them. It matters because
+upstream agents in an IB tree should be able to see *what's flowing
+through their book* (volumes, commissions, balances) without knowing
+*every personal name* of someone else's clients.
+
+### What's hidden by default
+
+When an agent looks at their Summary / Commissions / Dashboard /
+Trading Accounts page, here's what they see:
+
+| What | Visible? |
+|---|---|
+| **Their own direct clients' names + emails** | ✅ always |
+| **Their direct sub-agents' names** (the colleagues they imported) | ✅ always |
+| **Clients whose owning agent is a sub-agent below them** | ❌ name + email hidden by default |
+| **Volumes, commissions, balances, MT5 logins of those hidden clients** | ✅ always — only the name and email get hidden |
+
+In the UI, a hidden row shows as `🔒 MT5 #57755` (the MT5 login as the
+stable identifier) instead of the client's name.
+
+### How a sub-agent grants visibility
+
+A sub-agent who *wants* their parent to see their clients' names can
+opt in:
+
+1. Log in as that sub-agent.
+2. Bottom-left sidebar → **Privacy** button.
+3. Toggle on: *"Share client names with my parent agent."*
+
+Once enabled, the parent immediately sees the full names + emails on
+their next page refresh. The sub-agent can flip it off again any time.
+
+### Admin views always see everything
+
+The admin console (Agent Summary on the admin side, /admin/agents, etc.)
+**bypasses the privacy gate**. Admins always see full names + emails
+regardless of any sub-agent's setting. This is intentional — the admin
+runs the system and needs full visibility for support, compliance, and
+forensics.
+
+### Common admin questions
+
+**Q: An agent says they can see a client's name they shouldn't.**
+Check whether the client's owning sub-agent has enabled name-sharing.
+Admin → Audit Log → filter by `portal.me.privacy.update` — you can see
+who turned it on and when.
+
+**Q: An agent says they CAN'T see a client's name they expect to.**
+The client is owned by a sub-agent who hasn't granted sharing.
+That's working as designed. Tell the agent to ask their sub-agent
+to enable the toggle, OR have the admin look it up on their behalf.
+
+**Q: Can I override a sub-agent's privacy from the admin console?**
+No — the toggle is the sub-agent's decision. Admins can see the names
+themselves (the gate bypasses for admin views) but can't force the
+parent agent to see them.
+
+**Q: What about leads vs clients?**
+Same treatment. Both are stored as individuals; the redaction applies
+identically regardless of pipeline stage.
+
+---
+
+## 10. Things only your developer should touch
 
 Don't try these yourself unless you're comfortable with computers and the
 developer is unreachable:
@@ -315,7 +381,7 @@ restore from a recent backup.
 
 ---
 
-## 10. Glossary
+## 11. Glossary
 
 In case any term feels foreign:
 
@@ -340,7 +406,7 @@ In case any term feels foreign:
 
 ---
 
-## 11. Who to contact
+## 12. Who to contact
 
 | Question | Contact |
 |---|---|
