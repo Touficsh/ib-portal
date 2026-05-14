@@ -32,6 +32,86 @@ const HIERARCHY_LIMIT = 500;            // max nodes per page (CRM accepts up to
 const TA_BACKFILL_CONCURRENCY = 4;      // /trading-accounts calls in parallel for product backfill
 const TA_FRESHNESS_HOURS = 24;          // skip per-client trading-accounts call if synced within this window
 
+// Feature flag for the "agent owns their own trading accounts" path. When
+// true, every time we ingest an agent we also call
+// /api/contacts/:agentId/trading-accounts and stub the agent's personal
+// logins in trading_accounts_meta. This makes the commission engine credit
+// the agent (and cascade up to his parents) for trades on his own accounts.
+// Default: ON. Set ENABLE_AGENT_OWN_TA_FETCH=false to disable.
+const AGENT_OWN_TA_ENABLED = () =>
+  String(process.env.ENABLE_AGENT_OWN_TA_FETCH ?? 'true').toLowerCase() === 'true';
+
+/**
+ * Fetch the agent's OWN trading accounts (accounts attached directly to the
+ * agent's CRM contact, NOT clients beneath him) and stub them so the
+ * commission engine credits the agent for trades on them.
+ *
+ * Self-commission flow: by setting clients.agent_id on the agent's own row
+ * to the agent's own user.id, the engine pays L1 to the agent himself.
+ * L2/L3/... cascade up via users.parent_agent_id as usual.
+ *
+ * Idempotent. Best-effort: per-agent failures are logged but never abort the
+ * overall hierarchy sync.
+ */
+export async function syncAgentOwnTradingAccounts({ agentCrmId, agentUserId, summary }) {
+  if (!AGENT_OWN_TA_ENABLED()) {
+    summary.agentOwnTaSkipped = (summary.agentOwnTaSkipped || 0) + 1;
+    return;
+  }
+  if (!agentCrmId || !agentUserId) return;
+
+  try {
+    const resp = await crmRequest(
+      `/api/contacts/${agentCrmId}/trading-accounts?page=1&limit=100&accountType=real`,
+      { signal: AbortSignal.timeout(8000) }
+    );
+    const accounts = resp?.tradingAccounts?.data || [];
+    summary.agentOwnTaFetched = (summary.agentOwnTaFetched || 0) + 1;
+    if (accounts.length === 0) return;
+
+    const logins = accounts.map(a => String(a.login)).filter(Boolean);
+    if (logins.length === 0) return;
+
+    // Point the agent's own clients row at himself so commissions flow back.
+    // mt5_logins gets stored on the row too, mirroring how upsertClient
+    // handles a downstream client.
+    await pool.query(
+      `UPDATE clients SET
+         agent_id   = $1,
+         mt5_logins = $2,
+         is_trader  = true,
+         updated_at = NOW()
+       WHERE id = $3`,
+      [agentUserId, logins, agentCrmId]
+    );
+
+    // Stub trading_accounts_meta — same shape as upsertClient's stub. Product
+    // mapping (product_source_id) gets resolved lazily by the bridge-driven
+    // mt5_groups resolver when the first deal arrives.
+    for (const login of logins) {
+      try {
+        await pool.query(
+          `INSERT INTO trading_accounts_meta
+             (login, client_id, account_type, status, last_synced_at)
+           VALUES ($1, $2, 'real', true, NOW())
+           ON CONFLICT (login) DO UPDATE SET
+             client_id      = EXCLUDED.client_id,
+             last_synced_at = NOW()`,
+          [login, agentCrmId]
+        );
+        summary.agentOwnLoginsStubbed = (summary.agentOwnLoginsStubbed || 0) + 1;
+      } catch (rowErr) {
+        console.error('[HierSync] agent-own login stub failed:', login, rowErr.message);
+      }
+    }
+  } catch (err) {
+    if (err instanceof CrmPausedError) throw err;
+    // Per-agent failure is non-fatal — next sync will retry.
+    summary.agentOwnTaErrors = (summary.agentOwnTaErrors || 0) + 1;
+    console.error('[HierSync] agent-own TA fetch failed for', agentCrmId, '—', err?.message);
+  }
+}
+
 /**
  * Pull the agent's CRM record into clients (in case Refresh from CRM hasn't
  * happened recently). Idempotent.
@@ -205,6 +285,10 @@ async function walkChildren({ children, parentAgentCrmId, parentAgentUserId, rol
       const userId = await upsertAgent({
         node, parentAgentCrmId, parentAgentUserId, roleId, defaultPwHash, summary,
       });
+      // Pull this agent's own personal trading accounts (best-effort)
+      await syncAgentOwnTradingAccounts({
+        agentCrmId: node._id, agentUserId: userId, summary,
+      });
       // Recurse with this agent as the new parent
       await walkChildren({
         children: node.children,
@@ -336,6 +420,15 @@ export async function syncAgentHierarchy({ agentId, parentAgentUserId = null } =
       summary,
     });
 
+    // Pull the picked agent's OWN trading accounts before walking children.
+    // This ensures even agents with empty downlines get their personal
+    // logins ingested.
+    await syncAgentOwnTradingAccounts({
+      agentCrmId: agentId,
+      agentUserId: summary.pickedAgentUserId,
+      summary,
+    });
+
     // ─── ONE CALL — fetch the full subtree ─────────────────────────────
     let response;
     try {
@@ -449,6 +542,10 @@ export async function syncBranchHierarchy({ branchId, branchName }) {
         roleId: role.id,
         defaultPwHash,
         summary,
+      });
+      // Pull the root agent's OWN trading accounts (best-effort)
+      await syncAgentOwnTradingAccounts({
+        agentCrmId: root._id, agentUserId: userId, summary,
       });
       await walkChildren({
         children: root.children,
