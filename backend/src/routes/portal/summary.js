@@ -91,6 +91,13 @@ router.get('/', requirePortalPermission('portal.summary.view'), async (req, res,
 export async function buildSummaryPayload(viewerUserId, fromISO, toISO, productIds, { bypassRedaction = false } = {}) {
   const viewerId = viewerUserId;  // kept for readability below
   try {
+    // Fetch the live volume divisor once — used by the per-account lots
+    // formula below. Default 10000 matches the webhook's getMt5VolumeDivisor
+    // fallback so the two stay in sync if 'settings' is missing the row.
+    const { rows: [divRow] } = await pool.query(
+      `SELECT COALESCE((SELECT value::numeric FROM settings WHERE key = 'mt5_volume_divisor'), 10000) AS divisor`
+    );
+    const mt5VolumeDivisor = Number(divRow.divisor) || 10000;
 
     // Pull all accounts in viewer's scope in a single query. Classifier
     // columns tell us (a) which direct sub-agent each row belongs under (or
@@ -154,7 +161,19 @@ export async function buildSummaryPayload(viewerUserId, fromISO, toISO, productI
          tam.balance_cached, tam.equity_cached, tam.mt5_synced_at,
          -- Date-scoped aggregates from mt5_deal_cache. NULL date params
          -- mean "all time". Deposit/withdrawal come from balance_type rows,
-         -- lots from entry=0 legs, commission from ABS of any commission.
+         -- commission from ABS of any commission row.
+         --
+         -- LOTS FORMULA (changed 2026-05-13):
+         --   period_lots = SUM(volume) over BOTH legs / (2 × divisor)
+         -- Matches MT5 Manager's "Summary report → Volume" column halved.
+         -- Equivalent to "round-trip lots traded". A 0.01-lot open+close pair
+         -- contributes 0.01 here (not 0.02). On a one-sided day (open without
+         -- matching close, or close of an older open) the number is half of
+         -- the open size — this is intentional and consistent with MT5's
+         -- Summary report behavior when divided by 2.
+         --
+         -- Commission engine still pays on entry=0 only (unchanged); the
+         -- commissions.lots column is the source of truth for commission base.
          COALESCE(agg.period_lots,         0) AS lots_total,
          COALESCE(agg.period_commission,   0) AS commission_total,
          COALESCE(agg.period_deposits,     0) AS deposits_total,
@@ -164,7 +183,17 @@ export async function buildSummaryPayload(viewerUserId, fromISO, toISO, productI
        JOIN trading_accounts_meta tam ON tam.client_id = c.id
        LEFT JOIN (
          SELECT login,
-                SUM(lots) FILTER (WHERE entry = 0)                       AS period_lots,
+                -- Round-trip lots: SUM(volume) over every trade leg / (2 × divisor).
+                -- Matches MT5 Summary report's "Volume" column divided by 2.
+                -- Entry types included (all four MT5 trade entries):
+                --   0 ENTRY_IN     — opens a position
+                --   1 ENTRY_OUT    — closes a position
+                --   2 ENTRY_INOUT  — single deal that reverses a position
+                --   3 ENTRY_OUT_BY — closes one position via opposite of another
+                -- Balance ops (action=2 → entry IS NULL) are correctly excluded
+                -- because NULL is not IN any of these values.
+                (COALESCE(SUM(volume) FILTER (WHERE entry IN (0, 1, 2, 3)), 0)::numeric
+                   / (2.0 * $5::numeric))                                AS period_lots,
                 SUM(ABS(commission)) FILTER (WHERE commission IS NOT NULL) AS period_commission,
                 SUM(balance_amount) FILTER (WHERE balance_type = 'deposit')    AS period_deposits,
                 SUM(balance_amount) FILTER (WHERE balance_type = 'withdrawal') AS period_withdrawals
@@ -183,8 +212,9 @@ export async function buildSummaryPayload(viewerUserId, fromISO, toISO, productI
          -- any non-empty array constrains to those product_source_ids.
          AND (cardinality($4::text[]) = 0 OR tam.product_source_id = ANY($4::text[]))
        ORDER BY client_name, tam.login`,
-      // $1 = viewer user id, $2/$3 = date range (null = all time), $4 = product filter
-      [viewerId, fromISO, toISO, productIds]
+      // $1 = viewer user id, $2/$3 = date range (null = all time),
+      // $4 = product filter, $5 = mt5_volume_divisor (for round-trip lot math)
+      [viewerId, fromISO, toISO, productIds, mt5VolumeDivisor]
     );
 
     // Distinct products present in viewer's scope (for the filter chip row).
