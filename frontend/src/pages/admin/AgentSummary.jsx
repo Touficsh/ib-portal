@@ -636,21 +636,79 @@ export default function AgentSummary() {
   const [pickerOpen, setPickerOpen] = useState(!selectedAgentId);
   const [pickerQuery, setPickerQuery] = useState('');
 
+  // Picker filters — none of these are URL-bookmarked because the picker is
+  // ephemeral UI (once you've picked an agent, the filters don't matter).
+  // Defaults: no branch filter, all hierarchy levels, all activity buckets,
+  // active-only (hides disabled accounts by default).
+  const [branchFilter, setBranchFilter]     = useState('');
+  const [levelFilter, setLevelFilter]       = useState('all');     // all | top | sub
+  const [activityFilter, setActivityFilter] = useState('all');     // all | has_clients | has_subs | empty
+  const [statusFilter, setStatusFilter]     = useState('active');  // active | inactive | all
+
   // Full /api/... path because useApi prefixes '/api/portal/' for short paths
   // (meant for the agent portal). Admin endpoints live at /api/admin/* so we
   // pass the absolute URL.
   const { data: agents, loading: agentsLoading } = useApi('/api/admin/agent-summary/agents', {}, []);
 
+  // Distinct branch list for the dropdown — derived from the agents feed so
+  // we don't need a separate endpoint. Each option shows the agent count in
+  // that branch for quick scanning.
+  const branchOptions = useMemo(() => {
+    if (!agents) return [];
+    const counts = new Map();
+    for (const a of agents) {
+      const b = a.branch || '(no branch)';
+      counts.set(b, (counts.get(b) || 0) + 1);
+    }
+    return Array.from(counts.entries())
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([branch, count]) => ({ branch, count }));
+  }, [agents]);
+
   const filteredAgents = useMemo(() => {
     if (!agents) return [];
     const q = pickerQuery.trim().toLowerCase();
-    if (!q) return agents;
-    return agents.filter(a =>
-      (a.name || '').toLowerCase().includes(q) ||
-      (a.email || '').toLowerCase().includes(q) ||
-      (a.branch || '').toLowerCase().includes(q)
-    );
-  }, [agents, pickerQuery]);
+    return agents.filter(a => {
+      // Text search across name/email/branch
+      if (q) {
+        const hit =
+          (a.name || '').toLowerCase().includes(q) ||
+          (a.email || '').toLowerCase().includes(q) ||
+          (a.branch || '').toLowerCase().includes(q);
+        if (!hit) return false;
+      }
+      // Exact-match branch dropdown ('' = all; '(no branch)' = NULL branch)
+      if (branchFilter) {
+        const ab = a.branch || '(no branch)';
+        if (ab !== branchFilter) return false;
+      }
+      // Hierarchy level
+      if (levelFilter === 'top' && !a.is_top_level) return false;
+      if (levelFilter === 'sub' &&  a.is_top_level) return false;
+      // Activity bucket
+      const clients = a.direct_clients_count || 0;
+      const subs    = a.direct_sub_count     || 0;
+      if (activityFilter === 'has_clients' && clients === 0) return false;
+      if (activityFilter === 'has_subs'    && subs    === 0) return false;
+      if (activityFilter === 'empty'       && (clients > 0 || subs > 0)) return false;
+      // Active / inactive
+      if (statusFilter === 'active'   && a.is_active === false) return false;
+      if (statusFilter === 'inactive' && a.is_active !== false) return false;
+      return true;
+    });
+  }, [agents, pickerQuery, branchFilter, levelFilter, activityFilter, statusFilter]);
+
+  const hasActiveFilter =
+    !!pickerQuery || !!branchFilter ||
+    levelFilter !== 'all' || activityFilter !== 'all' || statusFilter !== 'active';
+
+  function clearAllFilters() {
+    setPickerQuery('');
+    setBranchFilter('');
+    setLevelFilter('all');
+    setActivityFilter('all');
+    setStatusFilter('active');
+  }
 
   function pickAgent(id) {
     const next = new URLSearchParams(searchParams);
@@ -944,14 +1002,106 @@ export default function AgentSummary() {
         {/* Inline agent picker — filterable list */}
         {pickerOpen && (
           <div className="pad" style={{ borderTop: '1px solid var(--border)' }}>
-            <input
-              className="input"
-              placeholder="Search agents by name, email, or branch…"
-              value={pickerQuery}
-              onChange={(e) => setPickerQuery(e.target.value)}
-              style={{ width: '100%', maxWidth: 480, marginBottom: 10 }}
-              autoFocus
-            />
+            {/* Row 1: text search + branch dropdown */}
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 10, alignItems: 'center' }}>
+              <input
+                className="input"
+                placeholder="Search agents by name, email, or branch…"
+                value={pickerQuery}
+                onChange={(e) => setPickerQuery(e.target.value)}
+                style={{ flex: '1 1 320px', minWidth: 240, maxWidth: 480 }}
+                autoFocus
+              />
+              <select
+                className="input"
+                value={branchFilter}
+                onChange={(e) => setBranchFilter(e.target.value)}
+                title="Filter agents by branch"
+                style={{ minWidth: 220 }}
+              >
+                <option value="">All branches ({agents?.length || 0})</option>
+                {branchOptions.map(b => (
+                  <option key={b.branch} value={b.branch}>
+                    {b.branch} — {b.count} agent{b.count === 1 ? '' : 's'}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {/* Row 2: filter chips (hierarchy + activity + status) */}
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 10, alignItems: 'center' }}>
+              <span className="muted small" style={{ marginRight: 4 }}>Level:</span>
+              {[
+                { key: 'all', label: 'All' },
+                { key: 'top', label: 'Top-level' },
+                { key: 'sub', label: 'Sub-agents' },
+              ].map(opt => (
+                <button
+                  key={opt.key}
+                  type="button"
+                  className={`btn ${levelFilter === opt.key ? '' : 'ghost'} small`}
+                  onClick={() => setLevelFilter(opt.key)}
+                >
+                  {opt.label}
+                </button>
+              ))}
+
+              <span className="muted small" style={{ marginLeft: 12, marginRight: 4 }}>Activity:</span>
+              {[
+                { key: 'all',         label: 'All' },
+                { key: 'has_clients', label: 'Has clients' },
+                { key: 'has_subs',    label: 'Has sub-agents' },
+                { key: 'empty',       label: 'Empty' },
+              ].map(opt => (
+                <button
+                  key={opt.key}
+                  type="button"
+                  className={`btn ${activityFilter === opt.key ? '' : 'ghost'} small`}
+                  onClick={() => setActivityFilter(opt.key)}
+                  title={opt.key === 'empty' ? 'No direct clients and no sub-agents' : undefined}
+                >
+                  {opt.label}
+                </button>
+              ))}
+
+              <span className="muted small" style={{ marginLeft: 12, marginRight: 4 }}>Status:</span>
+              {[
+                { key: 'active',   label: 'Active' },
+                { key: 'inactive', label: 'Inactive' },
+                { key: 'all',      label: 'All' },
+              ].map(opt => (
+                <button
+                  key={opt.key}
+                  type="button"
+                  className={`btn ${statusFilter === opt.key ? '' : 'ghost'} small`}
+                  onClick={() => setStatusFilter(opt.key)}
+                >
+                  {opt.label}
+                </button>
+              ))}
+
+              {hasActiveFilter && (
+                <button
+                  type="button"
+                  className="btn ghost small"
+                  onClick={clearAllFilters}
+                  style={{ marginLeft: 'auto' }}
+                  title="Reset all picker filters"
+                >
+                  <X size={12} /> Clear filters
+                </button>
+              )}
+            </div>
+
+            {/* Result count */}
+            {!agentsLoading && (
+              <div className="muted small" style={{ marginBottom: 8 }}>
+                {filteredAgents.length === (agents?.length || 0)
+                  ? `${filteredAgents.length} agent${filteredAgents.length === 1 ? '' : 's'}`
+                  : `${filteredAgents.length} of ${agents?.length || 0} agents shown`}
+              </div>
+            )}
+
             {agentsLoading && <div className="muted">Loading agents…</div>}
             {!agentsLoading && (
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: 8, maxHeight: 360, overflowY: 'auto' }}>
