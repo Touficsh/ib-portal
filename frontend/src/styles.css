@@ -634,6 +634,12 @@ h3 { font-size: var(--text-md);  font-weight: 600; }
 }
 .ct-rate-pencil { opacity: 0; transition: opacity var(--motion-fast); }
 .ct-rate-editable:hover .ct-rate-pencil { opacity: 1; }
+/* Disabled state — no CRM config, agent earns $0 (engine ignores any value here) */
+.ct-rate-disabled {
+  background: color-mix(in srgb, var(--muted) 12%, transparent);
+  color: var(--muted);
+  cursor: not-allowed;
+}
 
 /* Rate editor — inline input + save/cancel buttons */
 .ct-rate-editor {

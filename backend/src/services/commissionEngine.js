@@ -188,25 +188,23 @@ export async function computeWaterfallRows(db, deal) {
       const hasOverride = c.ov_pct != null || c.ov_per_lot != null;
       const hasCrm      = c.ccl_pct != null;  // LATERAL found a live CRM row
       const pct = Number(c.ov_pct != null ? c.ov_pct : (c.ccl_pct || 0));
-      // When this agent has no active CRM commission row at all (ccl_per_lot IS
-      // NULL — the LATERAL found zero matching rows), fall back to their legacy
-      // agent_products.rate_per_lot as the per-lot component. This handles the
-      // mixed-mode case: an agent whose parent already synced CRM levels but who
-      // lost their own CRM config (e.g. Sophia after CRM removed her rates).
-      // Without the fallback they'd drop to $0 the moment the chain enters NEW
-      // MATH, even though a manual $2/lot override is still set locally.
-      // Note: ccl_per_lot=0 (CRM explicitly set 0) is kept as 0 — we only fall
-      // back when ccl_per_lot is truly absent (NULL from the LEFT JOIN).
+      // CHANGED 2026-05-19: removed legacy agent_products.rate_per_lot fallback.
+      // Policy: if an agent has no CRM commission row, they earn $0 for the
+      // per-lot component. Only the CRM-synced rate (or its override) counts.
+      // Rationale: stops accidental fallback rates from paying agents when
+      // their CRM config hasn't been set up. To explicitly pay an agent
+      // without going through the CRM, add a row to crm_commission_levels
+      // with the desired override value.
       const per_lot = Number(
         c.ov_per_lot  != null ? c.ov_per_lot  :
         c.ccl_per_lot != null ? c.ccl_per_lot :
-        (c.rate_per_lot || 0)
+        0
       );
       // rate_source records which config path produced this row's rate:
       //   'crm_override' — override columns were set in the CRM level config
       //   'crm'          — standard synced CRM commission_percentage/per_lot
-      //   'fallback'     — no active CRM row; used agent_products.rate_per_lot
-      const rate_source = hasOverride ? 'crm_override' : hasCrm ? 'crm' : 'fallback';
+      //   'none'         — no CRM config; per_lot = 0
+      const rate_source = hasOverride ? 'crm_override' : hasCrm ? 'crm' : 'none';
       return { agent_id: c.agent_id, level: c.level, pct, per_lot, rate_source };
     });
 
@@ -477,6 +475,14 @@ export async function recomputeForAgent(agentId, fromDate, toDate, { dryRun = tr
   // --- Find all MT5 logins under this agent's subtree ----------------
   // "Under" = clients directly assigned to the agent, or to any sub-agent.
   // We need product_id too so we can scope to product.
+  //
+  // FIX 2026-05-19:
+  //   1) product info lives on trading_accounts_meta.product_source_id, NOT on
+  //      clients.product_id (always NULL in this schema). The old filter
+  //      `cl.product_id IS NOT NULL` excluded every row → recompute did nothing.
+  //   2) `product_source_id` is the CRM/Mongo ObjectID; computeWaterfallRows
+  //      expects the local UUID `products.id`. JOIN products.source_id to
+  //      translate before passing downstream.
   const { rows: loginRows } = await pool.query(
     `WITH RECURSIVE subtree AS (
        SELECT id FROM users WHERE id = $1 AND is_agent = true
@@ -485,12 +491,13 @@ export async function recomputeForAgent(agentId, fromDate, toDate, { dryRun = tr
        JOIN subtree s ON u.parent_agent_id = s.id
        WHERE u.is_agent = true AND u.is_active = true
      )
-     SELECT tam.login, tam.client_id, cl.product_id
+     SELECT tam.login, tam.client_id, p.id AS product_id
      FROM trading_accounts_meta tam
      JOIN clients cl ON cl.id = tam.client_id
+     JOIN products p ON p.source_id = tam.product_source_id
      WHERE cl.agent_id IN (SELECT id FROM subtree)
        AND tam.account_type IS DISTINCT FROM 'demo'
-       AND cl.product_id IS NOT NULL`,
+       AND tam.product_source_id IS NOT NULL`,
     [agentId]
   );
 

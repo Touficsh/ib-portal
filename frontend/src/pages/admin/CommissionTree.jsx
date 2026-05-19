@@ -195,6 +195,23 @@ function EditableRate({ agentId, product, onSaved }) {
     }
   }
 
+  // CHANGED 2026-05-19: when the agent has no CRM commission row for this
+  // product, the engine pays $0 (we removed the agent_products.rate_per_lot
+  // fallback). Display $0/lot here so the UI matches what the engine will
+  // actually pay. Click-to-edit is disabled in that state because the value
+  // would be ignored by the engine — the admin must add a CRM config row
+  // (or its override) instead.
+  if (!product.has_crm_config) {
+    return (
+      <span
+        className="ct-rate ct-rate-disabled mono"
+        title="No CRM config — agent earns $0 on this product. Add a CRM commission level to enable payouts."
+      >
+        $0.00/lot
+      </span>
+    );
+  }
+
   if (!editing) {
     return (
       <span

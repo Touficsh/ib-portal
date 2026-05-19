@@ -148,10 +148,10 @@ function ProductDetail({ product, agent, parentProduct = null, parentExists = fa
         ) : (
           <>
             <span
-              className={`ct-rate mono${violatesParent ? ' ct-rate-violates' : ''}`}
-              title={violatesParent ? violationTitle : 'Per-lot rate — no CRM commission level configured for this agent on this product'}
+              className="ct-rate ct-rate-disabled mono"
+              title="No CRM commission level configured — agent earns $0 on this product"
             >
-              {violatesParent && '⚠ '}${money(product.rate_per_lot)}/lot
+              $0.00/lot
             </span>
             <span className="muted small">max ${money(product.max_rate_per_lot)}</span>
             <span
