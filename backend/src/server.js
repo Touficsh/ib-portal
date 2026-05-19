@@ -261,7 +261,7 @@ async function start() {
     }
   });
 
-  app.listen(PORT, () => {
+  const server = app.listen(PORT, () => {
     console.log(`IB Agent Portal server running on port ${PORT}`);
 
     // Daily DB housekeeping — trims old engine_jobs, cycles, audit_log.
@@ -321,6 +321,28 @@ async function start() {
     }).catch(err => console.error('[DailyAgentRefresh] Failed to initialize:', err.message));
 
   });
+
+  // ─── Graceful shutdown ───────────────────────────────────────────────
+  // NSSM sends SIGTERM (or stops the process) on `sc stop`. Without this
+  // handler, in-flight commission writes and webhook deals can be cut
+  // mid-INSERT. We give the server up to 10 seconds to drain HTTP
+  // connections and close the DB pool, then exit.
+  function shutdown(signal) {
+    console.log(`[Shutdown] ${signal} received — draining HTTP and DB…`);
+    server.close((err) => {
+      if (err) console.error('[Shutdown] HTTP server close error:', err.message);
+      pool.end()
+        .then(() => { console.log('[Shutdown] Clean exit'); process.exit(0); })
+        .catch((e) => { console.error('[Shutdown] Pool end error:', e.message); process.exit(1); });
+    });
+    // Hard exit after 10s if cleanup hangs (NSSM will give us up to ~30s)
+    setTimeout(() => {
+      console.error('[Shutdown] Timed out after 10s — forcing exit');
+      process.exit(1);
+    }, 10_000).unref();
+  }
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT',  () => shutdown('SIGINT'));
 }
 
 start().catch(err => {
