@@ -19,8 +19,22 @@ import { cacheMw, invalidateCache } from '../services/responseCache.js';
 const router = Router();
 router.use(authenticate, requirePermission('portal.admin'));
 
-function parseDateParam(val) {
+/**
+ * Parse a date filter param. Accepts:
+ *   - Full ISO datetimes (`2026-05-19T14:30:00Z`) — passed through as-is.
+ *   - Date-only strings (`2026-05-19`) — interpreted as UTC.
+ *
+ * `boundary='end'` shifts date-only inputs to 00:00:00 UTC of the NEXT day,
+ * so `deal_time < $to` correctly INCLUDES all of the picked day.
+ */
+function parseDateParam(val, boundary = 'start') {
   if (!val) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(val)) {
+    const d = new Date(val + 'T00:00:00Z');
+    if (Number.isNaN(d.getTime())) return null;
+    if (boundary === 'end') d.setUTCDate(d.getUTCDate() + 1);
+    return d.toISOString();
+  }
   const d = new Date(val);
   return Number.isNaN(d.getTime()) ? null : d.toISOString();
 }
@@ -29,7 +43,7 @@ function parseDateParam(val) {
 router.get('/', async (req, res, next) => {
   try {
     const from = parseDateParam(req.query.from);
-    const to = parseDateParam(req.query.to);
+    const to = parseDateParam(req.query.to, 'end');
     const productId = req.query.product_id || null;
     const agentId = req.query.agent_id || null;
     const clientId = req.query.client_id || null;
@@ -104,7 +118,7 @@ router.get('/', async (req, res, next) => {
 router.get('/summary', async (req, res, next) => {
   try {
     const from = parseDateParam(req.query.from);
-    const to = parseDateParam(req.query.to);
+    const to = parseDateParam(req.query.to, 'end');
     const agentId = req.query.agent_id || null;
     const productId = req.query.product_id || null;
     const groupBy = (req.query.groupBy || 'day').toLowerCase();

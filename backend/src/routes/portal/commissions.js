@@ -25,8 +25,28 @@ const router = Router();
 // requirePortalPermission's built-in portal.admin shortcut.
 router.use(portalAuthenticate, requirePortalPermission('portal.commissions.view'));
 
-function parseDateParam(val) {
+/**
+ * Parse a date filter param. Accepts:
+ *   - Full ISO datetimes (`2026-05-19T14:30:00Z`) — passed through as-is.
+ *   - Date-only strings (`2026-05-19`) — interpreted as UTC.
+ *
+ * `boundary`:
+ *   - 'start' (default) — date-only becomes 00:00:00 UTC of that day.
+ *   - 'end'             — date-only becomes 00:00:00 UTC of the NEXT day,
+ *     so a `deal_time < $to` filter correctly INCLUDES all of that day.
+ *
+ * This fixes the previously-empty result when From and To were both set to
+ * today: the old code mapped both to "midnight of today", so the filter
+ * `deal_time >= today AND deal_time < today` matched zero rows.
+ */
+function parseDateParam(val, boundary = 'start') {
   if (!val) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(val)) {
+    const d = new Date(val + 'T00:00:00Z');
+    if (Number.isNaN(d.getTime())) return null;
+    if (boundary === 'end') d.setUTCDate(d.getUTCDate() + 1);
+    return d.toISOString();
+  }
   const d = new Date(val);
   return Number.isNaN(d.getTime()) ? null : d.toISOString();
 }
@@ -35,7 +55,7 @@ function parseDateParam(val) {
 router.get('/', async (req, res, next) => {
   try {
     const from = parseDateParam(req.query.from);
-    const to = parseDateParam(req.query.to);
+    const to = parseDateParam(req.query.to, 'end');
     const productId = req.query.product_id || null;
     const level = req.query.level != null ? Number(req.query.level) : null;
     const page = Math.max(1, Number(req.query.page) || 1);
@@ -150,7 +170,7 @@ router.get('/', async (req, res, next) => {
 router.get('/summary', async (req, res, next) => {
   try {
     const from = parseDateParam(req.query.from);
-    const to = parseDateParam(req.query.to);
+    const to = parseDateParam(req.query.to, 'end');
     const groupBy = (req.query.groupBy || 'day').toLowerCase();
     const allowedGroups = {
       day:          `date_trunc('day', c.deal_time)`,
