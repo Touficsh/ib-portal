@@ -1269,6 +1269,224 @@ router.get('/hierarchy', cacheMw({ ttl: 60 }), async (req, res, next) => {
 router.post('/export.xlsx', async (req, res, next) => exportXlsxHandler(req, res, next));
 router.get ('/export.xlsx', async (req, res, next) => exportXlsxHandler(req, res, next));
 
+// GET /api/agents/:agentId/commission-tree.xlsx
+//
+// Per-branch rate-card export. Pick any agent → download an XLSX with the
+// FULL subtree below them rendered as a readable tree: each agent appears as
+// a header row with their email + branch, followed by their products + rates
+// indented underneath, then their sub-agents indented further, and so on.
+//
+// Reuses the exact same SQL as /hierarchy so what you see in the Commission
+// Tree page matches the file byte-for-byte.
+router.get('/:agentId/commission-tree.xlsx', async (req, res, next) => {
+  try {
+    const rootAgentId = String(req.params.agentId);
+
+    // Sanity check + name for the filename
+    const { rows: [rootRow] } = await pool.query(
+      `SELECT u.id, u.name, c.branch
+       FROM users u LEFT JOIN clients c ON c.id = u.linked_client_id
+       WHERE u.id = $1 AND u.is_agent = true LIMIT 1`,
+      [rootAgentId]
+    );
+    if (!rootRow) {
+      return res.status(404).json({ error: 'Agent not found', agentId: rootAgentId });
+    }
+
+    // Same query shape as /hierarchy — full agents list + product links + CRM levels.
+    const [{ rows: agents }, { rows: links }, { rows: crmLevels }] = await Promise.all([
+      pool.query(
+        `SELECT u.id, u.name, u.email, u.parent_agent_id, u.is_active,
+                c.branch, c.country, c.phone
+         FROM users u
+         LEFT JOIN clients c ON c.id = u.linked_client_id
+         WHERE u.is_agent = true AND u.linked_client_id IS NOT NULL`
+      ),
+      pool.query(
+        `SELECT ap.agent_id, ap.product_id, ap.rate_per_lot, ap.source,
+                ap.is_active AS link_active,
+                p.name AS product_name, p.code, p.product_group, p.currency,
+                p.max_rate_per_lot, p.is_active AS product_active,
+                p.commission_per_lot AS broker_commission_per_lot
+         FROM agent_products ap
+         JOIN products p ON p.id = ap.product_id
+         WHERE ap.is_active = true
+         ORDER BY p.name`
+      ),
+      pool.query(
+        `SELECT DISTINCT ON (agent_user_id, product_id)
+                agent_user_id AS agent_id, product_id,
+                commission_percentage, commission_per_lot,
+                override_commission_percentage, override_commission_per_lot
+         FROM crm_commission_levels
+         WHERE is_active = true
+         ORDER BY agent_user_id, product_id,
+                  (commission_percentage > 0 OR commission_per_lot > 0) DESC,
+                  synced_at DESC`
+      ),
+    ]);
+
+    // Index CRM levels by (agent, product)
+    const crmByAgentProduct = new Map();
+    for (const cl of crmLevels) {
+      crmByAgentProduct.set(`${cl.agent_id}:${cl.product_id}`, {
+        commission_percentage: Number(cl.commission_percentage),
+        commission_per_lot:    Number(cl.commission_per_lot),
+        override_commission_percentage: cl.override_commission_percentage != null ? Number(cl.override_commission_percentage) : null,
+        override_commission_per_lot:    cl.override_commission_per_lot    != null ? Number(cl.override_commission_per_lot)    : null,
+      });
+    }
+
+    // Group products per agent with the same effective_* enrichment as /hierarchy.
+    const productsByAgent = new Map();
+    for (const l of links) {
+      const brokerPerLot = Number(l.broker_commission_per_lot || 0);
+      const crm = crmByAgentProduct.get(`${l.agent_id}:${l.product_id}`) || null;
+      let effectivePct = null, effectivePerLot = null, effectiveRatePerLot = null;
+      if (crm) {
+        effectivePct = crm.override_commission_percentage != null
+          ? crm.override_commission_percentage
+          : crm.commission_percentage;
+        effectivePerLot = crm.override_commission_per_lot != null
+          ? crm.override_commission_per_lot
+          : crm.commission_per_lot;
+        effectiveRatePerLot = Number((effectivePct * brokerPerLot / 100 + effectivePerLot).toFixed(4));
+      }
+      const arr = productsByAgent.get(l.agent_id) || [];
+      arr.push({
+        name: l.product_name,
+        code: l.code,
+        group: l.product_group,
+        rate_per_lot:    Number(l.rate_per_lot),
+        max_rate_per_lot:Number(l.max_rate_per_lot),
+        has_crm_config:  !!crm,
+        effective_pct:   effectivePct,
+        effective_per_lot: effectivePerLot,
+        effective_rate_per_lot: effectiveRatePerLot,
+      });
+      productsByAgent.set(l.agent_id, arr);
+    }
+
+    // Stitch agents into a tree, then find the chosen agent's subtree
+    const byId = new Map();
+    for (const a of agents) byId.set(a.id, { ...a, products: productsByAgent.get(a.id) || [], children: [] });
+    for (const a of agents) {
+      if (a.parent_agent_id && byId.has(a.parent_agent_id)) {
+        byId.get(a.parent_agent_id).children.push(byId.get(a.id));
+      }
+    }
+    const root = byId.get(rootAgentId);
+    if (!root) {
+      return res.status(404).json({ error: 'Agent not in hierarchy', agentId: rootAgentId });
+    }
+
+    // ─── Build the sheet as array-of-arrays ─────────────────────────────
+    // Column layout (deliberately one row type for both agents and products
+    // so Excel filtering works cleanly):
+    //
+    // A  Tree path (indented name with └─ tree characters for agent rows,
+    //    bullet "•" for product rows)
+    // B  Type           ("Agent" / "Product")
+    // C  Email          (agent rows only)
+    // D  Branch         (agent rows only)
+    // E  Active         (agent rows only — Yes/No)
+    // F  Per-lot $      (product rows — the display rate)
+    // G  Max $/lot      (product rows — product cap)
+    // H  CRM %          (product rows — synced commission_percentage)
+    // I  CRM $/lot      (product rows — synced rebate per lot)
+    // J  Effective $/lot (product rows — what the engine actually uses)
+    // K  Rate source    (product rows — crm / crm_override / none)
+    const HEADER = [
+      'Tree', 'Type', 'Email', 'Branch', 'Active',
+      'Per-lot $', 'Max $/lot', 'CRM %', 'CRM $/lot', 'Effective $/lot', 'Rate source',
+    ];
+    const rows = [HEADER];
+    let agentsEmitted = 0;
+    let productsEmitted = 0;
+
+    // Recursive walk — agent header → its products → children
+    function emit(node, level) {
+      // Visual indent for agent name: 2 spaces per level + "└─ " for non-roots
+      const agentIndent = level === 0
+        ? ''
+        : '  '.repeat(level) + '└─ ';
+      rows.push([
+        agentIndent + (node.name || ''),
+        'Agent',
+        node.email || '',
+        node.branch || '',
+        node.is_active ? 'Yes' : 'No',
+        '', '', '', '', '', '',
+      ]);
+      agentsEmitted++;
+
+      // Sort products by name for stability
+      const prods = (node.products || []).slice().sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+      for (const p of prods) {
+        // Determine rate-source label matching the engine's enum
+        const source = p.has_crm_config ? 'crm' : 'none';
+        const perLot = p.has_crm_config
+          ? (p.effective_rate_per_lot != null ? p.effective_rate_per_lot : 0)
+          : 0;
+        // Indent products 2 spaces deeper than their parent agent
+        const prodIndent = '  '.repeat(level + 1) + '• ';
+        rows.push([
+          prodIndent + (p.name || ''),
+          'Product',
+          '', '', '',
+          `$${Number(perLot).toFixed(2)}`,
+          `$${Number(p.max_rate_per_lot || 0).toFixed(2)}`,
+          p.has_crm_config && p.effective_pct != null ? `${Number(p.effective_pct).toFixed(2)}%` : '—',
+          p.has_crm_config && p.effective_per_lot != null ? `$${Number(p.effective_per_lot).toFixed(2)}` : '—',
+          `$${Number(p.effective_rate_per_lot || 0).toFixed(2)}`,
+          source,
+        ]);
+        productsEmitted++;
+      }
+      // Blank row between agents for readability
+      rows.push(['', '', '', '', '', '', '', '', '', '', '']);
+
+      // Recurse into children, sorted by name for stable ordering
+      const kids = (node.children || []).slice().sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+      for (const c of kids) emit(c, level + 1);
+    }
+    emit(root, 0);
+
+    // Build worksheet
+    const ws = XLSX.utils.aoa_to_sheet(rows);
+    ws['!cols'] = [
+      { wch: 44 }, // Tree
+      { wch: 10 }, // Type
+      { wch: 30 }, // Email
+      { wch: 18 }, // Branch
+      { wch:  8 }, // Active
+      { wch: 12 }, // Per-lot $
+      { wch: 12 }, // Max $/lot
+      { wch: 10 }, // CRM %
+      { wch: 12 }, // CRM $/lot
+      { wch: 16 }, // Effective $/lot
+      { wch: 14 }, // Rate source
+    ];
+    ws['!freeze'] = { xSplit: 0, ySplit: 1 };
+    ws['!autofilter'] = { ref: ws['!ref'] };
+
+    const wb = XLSX.utils.book_new();
+    const sheetName = (rootRow.name || 'Branch').replace(/[^a-zA-Z0-9 ]/g, '').slice(0, 28) || 'Branch';
+    XLSX.utils.book_append_sheet(wb, ws, sheetName);
+    const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+
+    const slug = (rootRow.name || 'branch').replace(/[^a-z0-9]+/gi, '-').toLowerCase();
+    const today = new Date().toISOString().slice(0, 10);
+    const filename = `commission-tree_${slug}_${today}.xlsx`;
+
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('X-Agents-Exported', String(agentsEmitted));
+    res.setHeader('X-Products-Exported', String(productsEmitted));
+    res.send(buf);
+  } catch (err) { next(err); }
+});
+
 async function exportXlsxHandler(req, res, next) {
   try {
     const body         = req.body || {};

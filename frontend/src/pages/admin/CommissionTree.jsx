@@ -2,10 +2,11 @@ import { useMemo, useState, useRef, useEffect } from 'react';
 import {
   GitBranch, ChevronRight, ChevronDown, Package,
   AlertTriangle, ArrowDown, Info, DollarSign, Trophy, Pencil, Check, X, Search,
-  RefreshCw, CloudDownload,
+  RefreshCw, CloudDownload, Download,
 } from 'lucide-react';
 import { useApi, useMutation, useAutoRefresh } from '../../hooks/useApi.js';
 import { toast, confirm } from '../../components/ui/toast.js';
+import { getToken } from '../../api.js';
 import JobProgressModal from '../../components/JobProgressModal.jsx';
 import LastUpdated from '../../components/LastUpdated.jsx';
 
@@ -455,6 +456,74 @@ function ProductDetail({ product, agent, onRateChanged, parentProduct = null, pa
   );
 }
 
+/**
+ * Inline button on each agent row: downloads the commission tree rooted at
+ * this agent as an XLSX. Server returns a tree-readable workbook with the
+ * agent + every descendant + their products and per-lot rates.
+ */
+function DownloadBranchButton({ agentId, agentName }) {
+  const [downloading, setDownloading] = useState(false);
+
+  async function onClick(e) {
+    e.stopPropagation();
+    if (downloading) return;
+    setDownloading(true);
+    try {
+      const res = await fetch(`/api/agents/${agentId}/commission-tree.xlsx`, {
+        headers: { 'Authorization': `Bearer ${getToken()}` },
+      });
+      if (!res.ok) {
+        let msg = `Download failed (HTTP ${res.status})`;
+        try { const j = await res.json(); if (j?.error) msg = j.error; } catch {}
+        throw new Error(msg);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      const slug = (agentName || 'branch').replace(/[^a-z0-9]+/gi, '-').toLowerCase();
+      a.download = `commission-tree_${slug}_${new Date().toISOString().slice(0,10)}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      const agentsExported = res.headers.get('X-Agents-Exported');
+      const productsExported = res.headers.get('X-Products-Exported');
+      toast.success(`Downloaded — ${agentsExported || '?'} agent${agentsExported === '1' ? '' : 's'}, ${productsExported || '?'} product row${productsExported === '1' ? '' : 's'}`);
+    } catch (err) {
+      toast.error(err.message || 'Download failed');
+    } finally {
+      setDownloading(false);
+    }
+  }
+
+  return (
+    <button
+      type="button"
+      className="ct-download-btn"
+      onClick={onClick}
+      disabled={downloading}
+      title={`Download ${agentName}'s branch (this agent + all sub-agents + rates) as XLSX`}
+      style={{
+        marginLeft: 'auto',
+        background: 'transparent',
+        border: '1px solid var(--border)',
+        borderRadius: 4,
+        padding: '2px 6px',
+        cursor: downloading ? 'wait' : 'pointer',
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 4,
+        fontSize: 11,
+        color: 'var(--muted)',
+      }}
+    >
+      <Download size={12} />
+      {downloading ? 'Exporting…' : 'Export'}
+    </button>
+  );
+}
+
 function AgentNode({ node, depth, earningsById, onRateChanged, initiallyOpen = false, autoExpand = false, highlight = '', parentProductsById = null }) {
   const [open, setOpen] = useState(initiallyOpen || depth === 0);
   const hasChildren = (node.children || []).length > 0;
@@ -536,6 +605,8 @@ function AgentNode({ node, depth, earningsById, onRateChanged, initiallyOpen = f
             {(node.direct_clients_count || 0) > 0 && (
               <span className="muted small">· {node.direct_clients_count} direct clients</span>
             )}
+            {/* Download branch rate-card as XLSX (this agent + their full subtree) */}
+            <DownloadBranchButton agentId={node.id} agentName={node.name} />
           </div>
 
           {products.length === 0 ? (
