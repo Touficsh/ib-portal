@@ -1434,24 +1434,19 @@ async function exportCommissionTreeXlsx(req, res, next) {
     }
 
     // ─── Build the sheet as array-of-arrays ─────────────────────────────
-    // Column layout (deliberately one row type for both agents and products
-    // so Excel filtering works cleanly):
+    // Column layout (one row type for both agents and products so Excel
+    // filtering by Type works cleanly):
     //
     // A  Tree path (indented name with └─ tree characters for agent rows,
     //    bullet "•" for product rows)
-    // B  Type           ("Agent" / "Product")
-    // C  Email          (agent rows only)
-    // D  Branch         (agent rows only)
-    // E  Active         (agent rows only — Yes/No)
-    // F  Per-lot $      (product rows — the display rate)
-    // G  Max $/lot      (product rows — product cap)
-    // H  CRM %          (product rows — synced commission_percentage)
-    // I  CRM $/lot      (product rows — synced rebate per lot)
-    // J  Effective $/lot (product rows — what the engine actually uses)
-    // K  Rate source    (product rows — crm / crm_override / none)
+    // B  Type       ("Agent" / "Product")
+    // C  Email      (agent rows only)
+    // D  Branch     (agent rows only)
+    // E  Active     (agent rows only — Yes/No)
+    // F  Per-lot $  (product rows — what the engine actually pays per lot,
+    //                $0.00 when the agent has no CRM commission config)
     const HEADER = [
-      'Tree', 'Type', 'Email', 'Branch', 'Active',
-      'Per-lot $', 'Max $/lot', 'CRM %', 'CRM $/lot', 'Effective $/lot', 'Rate source',
+      'Tree', 'Type', 'Email', 'Branch', 'Active', 'Per-lot $',
     ];
     const rows = [HEADER];
     let agentsEmitted = 0;
@@ -1495,12 +1490,11 @@ async function exportCommissionTreeXlsx(req, res, next) {
         node.email || '',
         node.branch || '',
         node.is_active ? 'Yes' : 'No',
-        '', '', '', '', '', '',
+        '',  // Per-lot $ is N/A for agent rows
       ]);
       agentsEmitted++;
 
       for (const p of prods) {
-        const source = p.has_crm_config ? 'crm' : 'none';
         const perLot = p.has_crm_config
           ? (p.effective_rate_per_lot != null ? p.effective_rate_per_lot : 0)
           : 0;
@@ -1510,15 +1504,11 @@ async function exportCommissionTreeXlsx(req, res, next) {
           'Product',
           '', '', '',
           `$${Number(perLot).toFixed(2)}`,
-          `$${Number(p.max_rate_per_lot || 0).toFixed(2)}`,
-          p.has_crm_config && p.effective_pct != null ? `${Number(p.effective_pct).toFixed(2)}%` : '—',
-          p.has_crm_config && p.effective_per_lot != null ? `$${Number(p.effective_per_lot).toFixed(2)}` : '—',
-          `$${Number(p.effective_rate_per_lot || 0).toFixed(2)}`,
-          source,
         ]);
         productsEmitted++;
       }
-      rows.push(['', '', '', '', '', '', '', '', '', '', '']);
+      // Blank separator row between agents
+      rows.push(['', '', '', '', '', '']);
 
       for (const c of kids) emit(c, nextAncestors);
     }
@@ -1544,11 +1534,6 @@ async function exportCommissionTreeXlsx(req, res, next) {
       { wch: 18 }, // Branch
       { wch:  8 }, // Active
       { wch: 12 }, // Per-lot $
-      { wch: 12 }, // Max $/lot
-      { wch: 10 }, // CRM %
-      { wch: 12 }, // CRM $/lot
-      { wch: 16 }, // Effective $/lot
-      { wch: 14 }, // Rate source
     ];
     ws['!freeze'] = { xSplit: 0, ySplit: 1 };
     ws['!autofilter'] = { ref: ws['!ref'] };
