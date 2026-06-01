@@ -457,71 +457,48 @@ function ProductDetail({ product, agent, onRateChanged, parentProduct = null, pa
 }
 
 /**
- * Inline button on each agent row: downloads the commission tree rooted at
- * this agent as an XLSX. Server returns a tree-readable workbook with the
- * agent + every descendant + their products and per-lot rates.
+ * Trigger an XLSX download of the commission tree, filter-aware.
+ *
+ *   branch      — branch to export (required)
+ *   agentIds    — optional allowlist (current visible agents after name filter)
+ *   productIds  — optional product allowlist
+ *
+ * Hits POST /api/agents/commission-tree.xlsx, which returns the workbook as a
+ * binary blob. On success, triggers a real browser download and toasts the
+ * row counts from the response headers.
  */
-function DownloadBranchButton({ agentId, agentName }) {
-  const [downloading, setDownloading] = useState(false);
-
-  async function onClick(e) {
-    e.stopPropagation();
-    if (downloading) return;
-    setDownloading(true);
-    try {
-      const res = await fetch(`/api/agents/${agentId}/commission-tree.xlsx`, {
-        headers: { 'Authorization': `Bearer ${getToken()}` },
-      });
-      if (!res.ok) {
-        let msg = `Download failed (HTTP ${res.status})`;
-        try { const j = await res.json(); if (j?.error) msg = j.error; } catch {}
-        throw new Error(msg);
-      }
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      const slug = (agentName || 'branch').replace(/[^a-z0-9]+/gi, '-').toLowerCase();
-      a.download = `commission-tree_${slug}_${new Date().toISOString().slice(0,10)}.xlsx`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
-      const agentsExported = res.headers.get('X-Agents-Exported');
-      const productsExported = res.headers.get('X-Products-Exported');
-      toast.success(`Downloaded — ${agentsExported || '?'} agent${agentsExported === '1' ? '' : 's'}, ${productsExported || '?'} product row${productsExported === '1' ? '' : 's'}`);
-    } catch (err) {
-      toast.error(err.message || 'Download failed');
-    } finally {
-      setDownloading(false);
-    }
+async function downloadCommissionTreeXlsx({ branch, agentIds, productIds, label }) {
+  const body = {};
+  if (branch)                  body.branch     = branch;
+  if (agentIds?.length)        body.agentIds   = agentIds;
+  if (productIds?.length)      body.productIds = productIds;
+  const res = await fetch('/api/agents/commission-tree.xlsx', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${getToken()}`,
+      'Content-Type':  'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    let msg = `Download failed (HTTP ${res.status})`;
+    try { const j = await res.json(); if (j?.error) msg = j.error; } catch {}
+    throw new Error(msg);
   }
-
-  return (
-    <button
-      type="button"
-      className="ct-download-btn"
-      onClick={onClick}
-      disabled={downloading}
-      title={`Download ${agentName}'s branch (this agent + all sub-agents + rates) as XLSX`}
-      style={{
-        marginLeft: 'auto',
-        background: 'transparent',
-        border: '1px solid var(--border)',
-        borderRadius: 4,
-        padding: '2px 6px',
-        cursor: downloading ? 'wait' : 'pointer',
-        display: 'inline-flex',
-        alignItems: 'center',
-        gap: 4,
-        fontSize: 11,
-        color: 'var(--muted)',
-      }}
-    >
-      <Download size={12} />
-      {downloading ? 'Exporting…' : 'Export'}
-    </button>
-  );
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  const slug = (label || branch || 'commission-tree').replace(/[^a-z0-9]+/gi, '-').toLowerCase();
+  a.download = `commission-tree_${slug}_${new Date().toISOString().slice(0, 10)}.xlsx`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  return {
+    agents:   Number(res.headers.get('X-Agents-Exported'))   || 0,
+    products: Number(res.headers.get('X-Products-Exported')) || 0,
+  };
 }
 
 function AgentNode({ node, depth, earningsById, onRateChanged, initiallyOpen = false, autoExpand = false, highlight = '', parentProductsById = null }) {
@@ -605,8 +582,6 @@ function AgentNode({ node, depth, earningsById, onRateChanged, initiallyOpen = f
             {(node.direct_clients_count || 0) > 0 && (
               <span className="muted small">· {node.direct_clients_count} direct clients</span>
             )}
-            {/* Download branch rate-card as XLSX (this agent + their full subtree) */}
-            <DownloadBranchButton agentId={node.id} agentName={node.name} />
           </div>
 
           {products.length === 0 ? (
@@ -655,6 +630,10 @@ export default function CommissionTree() {
   const [selectedBranch, setSelectedBranch] = useState('Paul Matar');
   // Agent-name filter
   const [q, setQ] = useState('');
+  // Product filter — single product_id or '' for "all products"
+  const [productFilter, setProductFilter] = useState('');
+  // Export-in-flight flag
+  const [exporting, setExporting] = useState(false);
   const { data: branches } = useApi('/api/agents/branches-with-counts', {}, []);
 
   // If the default branch isn't in the list (e.g. renamed), fall back to the top branch.
@@ -847,6 +826,61 @@ export default function CommissionTree() {
 
   const branchTotal = topEarners.reduce((s, a) => s + a.total, 0);
 
+  // Unique products in the current branch — for the product-filter dropdown.
+  // Built once from the loaded hierarchy so admins only see products that
+  // actually appear in this branch (not the global product list).
+  const branchProducts = useMemo(() => {
+    if (!hier?.roots) return [];
+    const byId = new Map();
+    function walk(node) {
+      for (const p of (node.products || [])) {
+        if (!byId.has(p.product_id)) byId.set(p.product_id, { id: p.product_id, name: p.name });
+      }
+      (node.children || []).forEach(walk);
+    }
+    hier.roots.forEach(walk);
+    return Array.from(byId.values()).sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+  }, [hier]);
+
+  // Collect the IDs of every agent currently visible in the filtered tree.
+  // The export sends this list so the XLSX matches exactly what the admin
+  // sees on screen (after the name-filter prune). Without it, the server
+  // would always export the whole branch regardless of the search input.
+  const visibleAgentIds = useMemo(() => {
+    const ids = [];
+    function walk(node) {
+      ids.push(node.id);
+      (node.children || []).forEach(walk);
+    }
+    filteredRoots.forEach(walk);
+    return ids;
+  }, [filteredRoots]);
+
+  async function handleExport() {
+    if (exporting || !selectedBranch) return;
+    setExporting(true);
+    try {
+      const filterLabel = [];
+      if (needle)         filterLabel.push(`search-${q.trim().slice(0, 16)}`);
+      if (productFilter)  filterLabel.push(`product-${(branchProducts.find(p => p.id === productFilter)?.name || '').slice(0, 16)}`);
+      const label = [selectedBranch, ...filterLabel].join('_');
+
+      const { agents, products } = await downloadCommissionTreeXlsx({
+        branch:     selectedBranch,
+        // Send the visible-agent list only when a search filter is active.
+        // Otherwise leave it off so the server exports the full branch.
+        agentIds:   needle ? visibleAgentIds : undefined,
+        productIds: productFilter ? [productFilter] : undefined,
+        label,
+      });
+      toast.success(`Exported — ${agents} agent${agents === 1 ? '' : 's'}, ${products} product row${products === 1 ? '' : 's'}`);
+    } catch (err) {
+      toast.error(err.message || 'Export failed');
+    } finally {
+      setExporting(false);
+    }
+  }
+
   return (
     <div>
       <header className="page-header" style={{ display: 'flex', alignItems: 'flex-start', gap: 12 }}>
@@ -891,6 +925,19 @@ export default function CommissionTree() {
           >
             <RefreshCw size={12} /> Force full
           </button>
+          <button
+            type="button"
+            className="btn"
+            onClick={handleExport}
+            disabled={exporting || loading || !selectedBranch}
+            title={
+              `Export the current view to Excel.\n` +
+              (needle ? `• Filtered to "${q.trim()}" (${visibleAgentIds.length} agents)\n` : `• Whole "${selectedBranch}" branch\n`) +
+              (productFilter ? `• Product: ${branchProducts.find(p => p.id === productFilter)?.name || ''}\n` : `• All products\n`)
+            }
+          >
+            <Download size={12} /> {exporting ? 'Exporting…' : 'Export'}
+          </button>
         </div>
       </header>
 
@@ -925,6 +972,22 @@ export default function CommissionTree() {
             </button>
           )}
         </div>
+        <label className="field inline">
+          <span>Product</span>
+          <select
+            className="input"
+            value={productFilter}
+            onChange={e => setProductFilter(e.target.value)}
+            title="Limit the Export to one product. Doesn't affect the on-screen tree."
+            style={{ minWidth: 200 }}
+            disabled={branchProducts.length === 0}
+          >
+            <option value="">All products ({branchProducts.length})</option>
+            {branchProducts.map(p => (
+              <option key={p.id} value={p.id}>{p.name}</option>
+            ))}
+          </select>
+        </label>
         <span className="muted small" style={{ marginLeft: 'auto' }}>
           {loading
             ? 'loading…'

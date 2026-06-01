@@ -1269,28 +1269,60 @@ router.get('/hierarchy', cacheMw({ ttl: 60 }), async (req, res, next) => {
 router.post('/export.xlsx', async (req, res, next) => exportXlsxHandler(req, res, next));
 router.get ('/export.xlsx', async (req, res, next) => exportXlsxHandler(req, res, next));
 
-// GET /api/agents/:agentId/commission-tree.xlsx
+// Commission-tree XLSX export.
 //
-// Per-branch rate-card export. Pick any agent → download an XLSX with the
-// FULL subtree below them rendered as a readable tree: each agent appears as
-// a header row with their email + branch, followed by their products + rates
-// indented underneath, then their sub-agents indented further, and so on.
+// Tree-readable workbook: each agent appears as a header row with their email +
+// branch, followed by their products + rates indented underneath, then their
+// sub-agents indented further. Reuses the exact same SQL as /hierarchy so what
+// you see in the Commission Tree page matches the file byte-for-byte.
 //
-// Reuses the exact same SQL as /hierarchy so what you see in the Commission
-// Tree page matches the file byte-for-byte.
-router.get('/:agentId/commission-tree.xlsx', async (req, res, next) => {
-  try {
-    const rootAgentId = String(req.params.agentId);
+// Two ways to call it:
+//
+//   GET  /api/agents/:agentId/commission-tree.xlsx
+//        → exports that agent + their full subtree (no other filters)
+//
+//   POST /api/agents/commission-tree.xlsx
+//        body: {
+//          branch?:     "Paul Matar",      // restrict to a single branch
+//          agentIds?:   ["uuid",...],      // explicit allowlist (filter-aware
+//                                          // export — what's currently visible
+//                                          // in the UI after the name filter)
+//          productIds?: ["uuid",...]       // only include these products
+//        }
+//        → exports every top-level agent in the branch that's allowed by the
+//          ID filter, recursing into descendants and applying the product filter
+//          per agent. Skipped agents collapse their kids upward (so the export
+//          tree stays connected even when an ancestor was filtered out).
+router.post('/commission-tree.xlsx', async (req, res, next) => exportCommissionTreeXlsx(req, res, next));
+router.get('/:agentId/commission-tree.xlsx', async (req, res, next) => exportCommissionTreeXlsx(req, res, next));
 
-    // Sanity check + name for the filename
-    const { rows: [rootRow] } = await pool.query(
-      `SELECT u.id, u.name, c.branch
-       FROM users u LEFT JOIN clients c ON c.id = u.linked_client_id
-       WHERE u.id = $1 AND u.is_agent = true LIMIT 1`,
-      [rootAgentId]
-    );
-    if (!rootRow) {
-      return res.status(404).json({ error: 'Agent not found', agentId: rootAgentId });
+async function exportCommissionTreeXlsx(req, res, next) {
+  try {
+    const body         = req.body || {};
+    const rootAgentId  = req.params.agentId ? String(req.params.agentId) : null;
+    const branchFilter = body.branch ? String(body.branch) : null;
+    const idsAllow     = Array.isArray(body.agentIds) && body.agentIds.length > 0
+      ? new Set(body.agentIds.map(String)) : null;
+    const productAllow = Array.isArray(body.productIds) && body.productIds.length > 0
+      ? new Set(body.productIds.map(String)) : null;
+
+    if (!rootAgentId && !branchFilter) {
+      return res.status(400).json({ error: 'Provide a branch (POST body) or agentId (URL path)' });
+    }
+
+    // Sanity check + name for the filename (when a single-agent root was given)
+    let rootRow = null;
+    if (rootAgentId) {
+      const { rows } = await pool.query(
+        `SELECT u.id, u.name, c.branch
+         FROM users u LEFT JOIN clients c ON c.id = u.linked_client_id
+         WHERE u.id = $1 AND u.is_agent = true LIMIT 1`,
+        [rootAgentId]
+      );
+      if (rows.length === 0) {
+        return res.status(404).json({ error: 'Agent not found', agentId: rootAgentId });
+      }
+      rootRow = rows[0];
     }
 
     // Same query shape as /hierarchy — full agents list + product links + CRM levels.
@@ -1354,6 +1386,7 @@ router.get('/:agentId/commission-tree.xlsx', async (req, res, next) => {
       }
       const arr = productsByAgent.get(l.agent_id) || [];
       arr.push({
+        product_id: l.product_id,         // needed by the productAllow filter
         name: l.product_name,
         code: l.code,
         group: l.product_group,
@@ -1367,7 +1400,7 @@ router.get('/:agentId/commission-tree.xlsx', async (req, res, next) => {
       productsByAgent.set(l.agent_id, arr);
     }
 
-    // Stitch agents into a tree, then find the chosen agent's subtree
+    // Stitch agents into a tree
     const byId = new Map();
     for (const a of agents) byId.set(a.id, { ...a, products: productsByAgent.get(a.id) || [], children: [] });
     for (const a of agents) {
@@ -1375,9 +1408,29 @@ router.get('/:agentId/commission-tree.xlsx', async (req, res, next) => {
         byId.get(a.parent_agent_id).children.push(byId.get(a.id));
       }
     }
-    const root = byId.get(rootAgentId);
-    if (!root) {
-      return res.status(404).json({ error: 'Agent not in hierarchy', agentId: rootAgentId });
+
+    // Pick the starting roots:
+    //   - rootAgentId set → just that agent's subtree
+    //   - else branchFilter → every top-level agent in that branch (no
+    //     parent_agent_id, branch matches)
+    let startingRoots = [];
+    if (rootAgentId) {
+      const root = byId.get(rootAgentId);
+      if (!root) {
+        return res.status(404).json({ error: 'Agent not in hierarchy', agentId: rootAgentId });
+      }
+      startingRoots = [root];
+    } else if (branchFilter) {
+      for (const a of agents) {
+        const node = byId.get(a.id);
+        const isTopLevel = !a.parent_agent_id || !byId.has(a.parent_agent_id);
+        if (isTopLevel && (a.branch || '') === branchFilter) {
+          startingRoots.push(node);
+        }
+      }
+      if (startingRoots.length === 0) {
+        return res.status(404).json({ error: `No top-level agents in branch "${branchFilter}"` });
+      }
     }
 
     // ─── Build the sheet as array-of-arrays ─────────────────────────────
@@ -1404,12 +1457,38 @@ router.get('/:agentId/commission-tree.xlsx', async (req, res, next) => {
     let agentsEmitted = 0;
     let productsEmitted = 0;
 
-    // Recursive walk — agent header → its products → children
-    function emit(node, level) {
-      // Visual indent for agent name: 2 spaces per level + "└─ " for non-roots
-      const agentIndent = level === 0
-        ? ''
-        : '  '.repeat(level) + '└─ ';
+    // Recursive walk — agent header → its (filtered) products → children
+    //
+    // `allowedAncestors` mirrors the same trick the other exporter uses:
+    // it's the number of ALLOWED agents above this one in the chain. If
+    // this agent is NOT allowed (filtered out), we still recurse but don't
+    // emit anything for them and don't bump the depth — so their kids
+    // collapse upward to the nearest allowed ancestor's depth + 1. That
+    // keeps the export tree connected even when an ancestor was hidden.
+    function emit(node, allowedAncestors) {
+      const isAllowed = !idsAllow || idsAllow.has(node.id);
+      const nextAncestors = isAllowed ? allowedAncestors + 1 : allowedAncestors;
+      const kids = (node.children || []).slice().sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+      if (!isAllowed) {
+        for (const c of kids) emit(c, nextAncestors);
+        return;
+      }
+      const level = allowedAncestors;  // depth = # of allowed ancestors above me
+      // Apply product filter: only include products in the allowlist (if any)
+      const prods = (node.products || [])
+        .filter(p => !productAllow || productAllow.has(p.product_id))
+        .slice()
+        .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+
+      // Skip emitting agents that have no products under the filter AND no
+      // children (would just be noise). Keep them when they have kids in
+      // case a descendant matches the filter.
+      const hasMatchingDescendants = hasAnyMatchingProduct(node);
+      if (productAllow && prods.length === 0 && !hasMatchingDescendants) {
+        return;
+      }
+
+      const agentIndent = level === 0 ? '' : '  '.repeat(level) + '└─ ';
       rows.push([
         agentIndent + (node.name || ''),
         'Agent',
@@ -1420,15 +1499,11 @@ router.get('/:agentId/commission-tree.xlsx', async (req, res, next) => {
       ]);
       agentsEmitted++;
 
-      // Sort products by name for stability
-      const prods = (node.products || []).slice().sort((a, b) => (a.name || '').localeCompare(b.name || ''));
       for (const p of prods) {
-        // Determine rate-source label matching the engine's enum
         const source = p.has_crm_config ? 'crm' : 'none';
         const perLot = p.has_crm_config
           ? (p.effective_rate_per_lot != null ? p.effective_rate_per_lot : 0)
           : 0;
-        // Indent products 2 spaces deeper than their parent agent
         const prodIndent = '  '.repeat(level + 1) + '• ';
         rows.push([
           prodIndent + (p.name || ''),
@@ -1443,14 +1518,22 @@ router.get('/:agentId/commission-tree.xlsx', async (req, res, next) => {
         ]);
         productsEmitted++;
       }
-      // Blank row between agents for readability
       rows.push(['', '', '', '', '', '', '', '', '', '', '']);
 
-      // Recurse into children, sorted by name for stable ordering
-      const kids = (node.children || []).slice().sort((a, b) => (a.name || '').localeCompare(b.name || ''));
-      for (const c of kids) emit(c, level + 1);
+      for (const c of kids) emit(c, nextAncestors);
     }
-    emit(root, 0);
+
+    // Helper: does this node OR any descendant carry a product matching the filter?
+    // Used to decide whether to keep agent rows that have no matching products
+    // of their own (so chains stay intact when a descendant matches).
+    function hasAnyMatchingProduct(node) {
+      if (!productAllow) return true;
+      const own = (node.products || []).some(p => productAllow.has(p.product_id));
+      if (own) return true;
+      return (node.children || []).some(c => hasAnyMatchingProduct(c));
+    }
+
+    for (const r of startingRoots) emit(r, 0);
 
     // Build worksheet
     const ws = XLSX.utils.aoa_to_sheet(rows);
@@ -1471,13 +1554,15 @@ router.get('/:agentId/commission-tree.xlsx', async (req, res, next) => {
     ws['!autofilter'] = { ref: ws['!ref'] };
 
     const wb = XLSX.utils.book_new();
-    const sheetName = (rootRow.name || 'Branch').replace(/[^a-zA-Z0-9 ]/g, '').slice(0, 28) || 'Branch';
+    const exportLabel = rootRow?.name || branchFilter || 'Commission tree';
+    const sheetName = exportLabel.replace(/[^a-zA-Z0-9 ]/g, '').slice(0, 28) || 'Branch';
     XLSX.utils.book_append_sheet(wb, ws, sheetName);
     const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
 
-    const slug = (rootRow.name || 'branch').replace(/[^a-z0-9]+/gi, '-').toLowerCase();
+    const slug = exportLabel.replace(/[^a-z0-9]+/gi, '-').toLowerCase();
+    const filterTag = productAllow ? '_product-filter' : idsAllow ? '_filtered' : '';
     const today = new Date().toISOString().slice(0, 10);
-    const filename = `commission-tree_${slug}_${today}.xlsx`;
+    const filename = `commission-tree_${slug}${filterTag}_${today}.xlsx`;
 
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
@@ -1485,7 +1570,7 @@ router.get('/:agentId/commission-tree.xlsx', async (req, res, next) => {
     res.setHeader('X-Products-Exported', String(productsEmitted));
     res.send(buf);
   } catch (err) { next(err); }
-});
+}
 
 async function exportXlsxHandler(req, res, next) {
   try {
