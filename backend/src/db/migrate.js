@@ -541,21 +541,29 @@ ALTER TABLE commissions
 -- client hard-delete. Now NO ACTION — caller must explicitly reassign or
 -- soft-delete before removing a client. Idempotent: drops by name, re-adds
 -- with the new ON DELETE rule.
+-- IMPORTANT: NOT VALID is intentional. Without it, ADD CONSTRAINT scans the
+-- entire table (commissions has 100K+ rows on prod) to validate every row's
+-- client_id reference. On Supabase, that scan exceeds the statement timeout,
+-- the whole DO block aborts, and the backend startup migration fails causing
+-- a restart loop. NOT VALID adds the constraint instantly without scanning.
+-- New rows are still validated; existing rows are taken on faith. Run
+--   ALTER TABLE x VALIDATE CONSTRAINT y
+-- manually off-hours if you ever need to back-fill the check.
 DO $hardening_fks$
 BEGIN
-  IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'commissions_client_id_fkey') THEN
-    ALTER TABLE commissions DROP CONSTRAINT commissions_client_id_fkey;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'commissions_client_id_fkey') THEN
+    ALTER TABLE commissions
+      ADD CONSTRAINT commissions_client_id_fkey
+      FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE NO ACTION
+      NOT VALID;
   END IF;
-  ALTER TABLE commissions
-    ADD CONSTRAINT commissions_client_id_fkey
-    FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE NO ACTION;
 
-  IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'commission_engine_jobs_client_id_fkey') THEN
-    ALTER TABLE commission_engine_jobs DROP CONSTRAINT commission_engine_jobs_client_id_fkey;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'commission_engine_jobs_client_id_fkey') THEN
+    ALTER TABLE commission_engine_jobs
+      ADD CONSTRAINT commission_engine_jobs_client_id_fkey
+      FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE NO ACTION
+      NOT VALID;
   END IF;
-  ALTER TABLE commission_engine_jobs
-    ADD CONSTRAINT commission_engine_jobs_client_id_fkey
-    FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE NO ACTION;
 END $hardening_fks$;
 
 -- Auto-stamp updated_at on every UPDATE so app code can never forget. One
