@@ -58,9 +58,39 @@ async function start() {
   // Background DB pool state collector (exposed via /metrics)
   startDbPoolMetricsCollector(pool);
 
-  // Run schema migration on startup (idempotent — all CREATE IF NOT EXISTS)
-  await pool.query(migration);
-  console.log('Migration applied');
+  // Run schema migration on startup (idempotent — all CREATE IF NOT EXISTS).
+  //
+  // Retry with backoff if the DB is temporarily unreachable. Without this,
+  // a transient Supabase blip (project restart, brief auth hiccup) was
+  // putting the process into a crash-loop: server.js throws, NSSM restarts,
+  // server.js throws again, and so on — each restart blowing through pool
+  // connections faster than they can be released. The loop made the
+  // recovery harder than the original blip.
+  let attempt = 0;
+  const maxAttempts = 12;             // ~6 min worst-case (5s + 5,10,20,30s caps)
+  const baseDelayMs = 5_000;
+  while (true) {
+    attempt++;
+    try {
+      await pool.query(migration);
+      console.log(`Migration applied (attempt ${attempt})`);
+      break;
+    } catch (err) {
+      const isRetryable =
+        err.code === 'ECONNREFUSED' ||
+        err.code === 'ETIMEDOUT' ||
+        err.code === 'ECHECKOUTTIMEOUT' ||
+        err.code === 'ECIRCUITBREAKER' ||
+        (err.message || '').includes('Connection terminated');
+      if (!isRetryable || attempt >= maxAttempts) {
+        console.error(`Migration failed (attempt ${attempt}/${maxAttempts}, code=${err.code}):`, err.message);
+        throw err;
+      }
+      const delay = Math.min(30_000, baseDelayMs * Math.pow(1.5, attempt - 1));
+      console.warn(`Migration attempt ${attempt} failed (${err.code}). Retrying in ${Math.round(delay / 1000)}s…`);
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
 
   // If mt5_deal_cache has been partitioned, make sure next month's partition exists.
   try {
@@ -227,18 +257,38 @@ async function start() {
   // to fetch its MT5 manager credentials from the portal's `settings` table.
   // This replaces the old live-crm-sales endpoint of the same path so the
   // bridge keeps working with `CRM_BACKEND_URL=http://localhost:3001`.
+  //
+  // CACHED: the bridge polls this every 15 seconds during normal operation.
+  // The underlying `settings` row barely ever changes (manual admin edit
+  // only), so we cache the response in-memory for 5 minutes. Eliminates
+  // the steady-state DB load from the bridge poll (was ~5,760 queries/day
+  // before this cache; now ~288/day). Cleared on POST to admin settings
+  // (see clearMt5InternalCache in admin/settings.js).
+  let mt5InternalCache = { at: 0, payload: null };
+  const MT5_INTERNAL_TTL_MS = 5 * 60_000;  // 5 minutes
   app.get('/api/settings/mt5/internal', async (req, res) => {
     try {
       const ip = req.ip || req.connection?.remoteAddress || '';
       const isLocal = ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
       if (!isLocal) return res.status(403).json({ error: 'Forbidden' });
+      const now = Date.now();
+      if (mt5InternalCache.payload && (now - mt5InternalCache.at) < MT5_INTERNAL_TTL_MS) {
+        return res.json(mt5InternalCache.payload);
+      }
       const { rows } = await pool.query(
         `SELECT key, value FROM settings WHERE key LIKE 'mt5\\_%' ESCAPE '\\'`
       );
       const mt5 = {};
       for (const row of rows) mt5[row.key.replace('mt5_', '')] = row.value;
+      mt5InternalCache = { at: now, payload: mt5 };
       res.json(mt5);
     } catch (err) {
+      // On DB error, serve stale-if-available instead of 500 — keeps the
+      // bridge alive across short DB hiccups (e.g. Supabase restart).
+      if (mt5InternalCache.payload) {
+        res.setHeader('X-Cache-Stale', '1');
+        return res.json(mt5InternalCache.payload);
+      }
       res.status(500).json({ error: err.message });
     }
   });
