@@ -15,6 +15,12 @@ import { httpMetricsMiddleware, metricsHandler, startDbPoolMetricsCollector } fr
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// Trust one proxy hop — Caddy in front of Node. Without this, express-rate-limit
+// throws ERR_ERL_UNEXPECTED_X_FORWARDED_FOR on every request that came through
+// the reverse proxy, which can stall response handlers. Setting `1` accepts the
+// X-Forwarded-For from Caddy (our only trusted hop) and rejects multi-hop spoofing.
+app.set('trust proxy', 1);
+
 app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:5201', credentials: true }));
 // 1MB body limit (default is 100KB) — comfortably fits the Agent Network
 // Excel export's POST'd ID list even with tens of thousands of agents.
