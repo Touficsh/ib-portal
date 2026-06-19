@@ -47,6 +47,12 @@ function buildPool(connectionString) {
     // Release idle connections after 30 s so we give Supabase slots back
     // quickly during quiet periods.
     idleTimeoutMillis: 30_000,
+    // statement_timeout = 2 minutes per connection. Supabase's default
+    // is short (~8 s) which causes the startup migration to fail on a
+    // freshly-restarted nano instance. Setting it via the `-c` startup
+    // option survives PgBouncer transaction mode, unlike a SET inside
+    // the query string which the pooler resets between transactions.
+    options: '-c statement_timeout=120000',
   });
 }
 
