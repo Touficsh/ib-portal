@@ -203,6 +203,15 @@ export function startMt5SyncScheduler({
   activeDays  = DEFAULT_ACTIVE_DAYS,
   delayMin    = DEFAULT_DELAY_MIN,
 } = {}) {
+  // Opt-out via ENABLE_MT5_SWEEP=false (default true for backwards
+  // compatibility). The webhook stream from the bridge handles 99%+ of
+  // deals; this sweep is only a safety net for outages. Turn it off in
+  // beta deployments to minimize bridge load.
+  const enabled = String(process.env.ENABLE_MT5_SWEEP || 'true').toLowerCase() === 'true';
+  if (!enabled) {
+    console.log('[MT5Sweep] disabled (set ENABLE_MT5_SWEEP=true to enable)');
+    return;
+  }
   // Read overrides from env vars if set
   const effectiveInterval = Math.max(5,
     Number(process.env.MT5_SWEEP_INTERVAL_MIN) || intervalMin
