@@ -4,6 +4,14 @@ export const migration = `
 -- All statements are idempotent (CREATE/ALTER IF NOT EXISTS).
 -- ============================================================
 
+-- Give the migration plenty of headroom. Supabase's PgBouncer applies a
+-- short default statement timeout (~8s) per pooled connection, and a few
+-- of the ADD INDEX / ADD COLUMN statements below briefly need longer on a
+-- freshly-restarted nano instance with cold caches. SET LOCAL would be
+-- nicer but pgbouncer transaction mode resets it; plain SET is per-session
+-- here. 2 minutes is enough for any single statement we run.
+SET statement_timeout = '120s';
+
 -- Users table (agents, admins)
 CREATE TABLE IF NOT EXISTS users (
   id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),

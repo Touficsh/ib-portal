@@ -87,6 +87,9 @@ async function start() {
         err.code === 'ETIMEDOUT' ||
         err.code === 'ECHECKOUTTIMEOUT' ||
         err.code === 'ECIRCUITBREAKER' ||
+        err.code === '57014' ||  // statement timeout — common on a freshly-
+                                  // restarted Supabase nano w/ cold caches
+        err.code === '57P03' ||  // cannot_connect_now (e.g. starting up)
         (err.message || '').includes('Connection terminated');
       if (!isRetryable || attempt >= maxAttempts) {
         console.error(`Migration failed (attempt ${attempt}/${maxAttempts}, code=${err.code}):`, err.message);
