@@ -72,32 +72,41 @@ async function start() {
   // server.js throws again, and so on — each restart blowing through pool
   // connections faster than they can be released. The loop made the
   // recovery harder than the original blip.
-  let attempt = 0;
-  const maxAttempts = 12;             // ~6 min worst-case (5s + 5,10,20,30s caps)
-  const baseDelayMs = 5_000;
-  while (true) {
-    attempt++;
-    try {
-      await pool.query(migration);
-      console.log(`Migration applied (attempt ${attempt})`);
-      break;
-    } catch (err) {
-      const isRetryable =
-        err.code === 'ECONNREFUSED' ||
-        err.code === 'ETIMEDOUT' ||
-        err.code === 'ECHECKOUTTIMEOUT' ||
-        err.code === 'ECIRCUITBREAKER' ||
-        err.code === '57014' ||  // statement timeout — common on a freshly-
-                                  // restarted Supabase nano w/ cold caches
-        err.code === '57P03' ||  // cannot_connect_now (e.g. starting up)
-        (err.message || '').includes('Connection terminated');
-      if (!isRetryable || attempt >= maxAttempts) {
-        console.error(`Migration failed (attempt ${attempt}/${maxAttempts}, code=${err.code}):`, err.message);
-        throw err;
+  // Skip the migration entirely if SKIP_MIGRATION_ON_STARTUP=true. The
+  // schema in Supabase is already up to date (the migration is idempotent
+  // and has been applied many times), so re-running it on every restart is
+  // just a startup-time tax. When it times out on a freshly-restarted
+  // Supabase nano, it takes the whole portal down. Skipping it makes the
+  // boot resilient to that. Re-enable + restart only when you intentionally
+  // need a schema change applied (or just run `npm run db:migrate` manually).
+  if (String(process.env.SKIP_MIGRATION_ON_STARTUP || 'false').toLowerCase() === 'true') {
+    console.log('Migration skipped (SKIP_MIGRATION_ON_STARTUP=true).');
+  } else {
+    let attempt = 0;
+    const maxAttempts = 3;              // try briefly, then continue without
+    const baseDelayMs = 5_000;
+    let migrated = false;
+    while (attempt < maxAttempts) {
+      attempt++;
+      try {
+        await pool.query(migration);
+        console.log(`Migration applied (attempt ${attempt})`);
+        migrated = true;
+        break;
+      } catch (err) {
+        const delay = Math.min(15_000, baseDelayMs * Math.pow(1.5, attempt - 1));
+        console.warn(`Migration attempt ${attempt}/${maxAttempts} failed (${err.code} — ${err.message}).` +
+                     (attempt < maxAttempts ? ` Retrying in ${Math.round(delay / 1000)}s…` : ''));
+        if (attempt < maxAttempts) await new Promise(r => setTimeout(r, delay));
       }
-      const delay = Math.min(30_000, baseDelayMs * Math.pow(1.5, attempt - 1));
-      console.warn(`Migration attempt ${attempt} failed (${err.code}). Retrying in ${Math.round(delay / 1000)}s…`);
-      await new Promise(r => setTimeout(r, delay));
+    }
+    if (!migrated) {
+      // Migration kept failing — usually a Supabase statement timeout on a
+      // cold nano. Continue startup anyway: the schema is already in place
+      // and the migration is idempotent. If a NEW migration step was
+      // genuinely needed, the runtime queries that depend on it will fail
+      // and surface the issue more loudly than a startup crash loop.
+      console.error('Migration failed after retries — continuing without it. Run npm run db:migrate manually if needed.');
     }
   }
 
